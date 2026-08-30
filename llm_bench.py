@@ -32,6 +32,7 @@ dashboard.html can group comparable runs reliably.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -928,6 +929,23 @@ def _lm_eval_result_payload(output_dir: Path) -> dict:
     return max(candidates, key=lambda item: item[0].stat().st_mtime_ns)[1]
 
 
+def _lm_eval_cache_path(results_dir: Path, base_url: str, model: str,
+                        tasks: str, backend: str, num_fewshot: int | None,
+                        experiment_id: str) -> Path:
+    """Return a stable response-cache path for one comparable evaluation."""
+    context = json.dumps({
+        "base_url": base_url.rstrip("/"),
+        "model": model,
+        "tasks": tasks,
+        "backend": backend,
+        "num_fewshot": num_fewshot,
+        "experiment_id": experiment_id,
+    }, sort_keys=True).encode()
+    digest = hashlib.sha256(context).hexdigest()[:16]
+    model_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", model).strip("._") or "model"
+    return results_dir / ".lm-eval-cache" / f"{model_name}-{digest}"
+
+
 def _lm_eval_stderr_key(metric: str, metrics: dict) -> str | None:
     base, separator, suffix = metric.partition(",")
     candidates = [
@@ -999,6 +1017,14 @@ def run_lm_eval(base_url: str, model: str, results_dir: Path, tasks: str,
     elif backend != "chat":
         raise ValueError(f"unknown lm-eval backend: {backend}")
     tasks = ",".join(task.strip() for task in tasks.split(",") if task.strip())
+    cache_path = _lm_eval_cache_path(
+        results_dir, base_url, model, tasks, backend, num_fewshot, experiment_id
+    )
+    cache_db = Path(str(cache_path) + "_rank0.db")
+    if cache_db.exists():
+        print(f"resuming from cached lm-eval responses: {cache_db}")
+    else:
+        print(f"lm-eval response checkpoint: {cache_db}")
     command = [
         executable,
         "run",
@@ -1009,6 +1035,7 @@ def run_lm_eval(base_url: str, model: str, results_dir: Path, tasks: str,
         "--model_args",
         f"base_url={endpoint},model={model},tokenized_requests=false",
         "--tasks", tasks,
+        "--use_cache", str(cache_path),
     ]
     if limit is not None:
         command.extend(["--limit", str(limit)])

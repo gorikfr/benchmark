@@ -84,11 +84,12 @@ def main():
         command = run.call_args.args[0]
         output = Path(tmp) / "test-model.jsonl"
         wrote = output.exists()
-    check("lm-eval: invokes local chat backend with requested options",
+    check("lm-eval: invokes local backend with requested options and checkpointing",
           len(rows) == 2 and command[:6] == [
               "/bin/lm-eval", "run", "--model", "local-completions",
               "--model_args", "base_url=http://localhost:11234/v1/completions,model=test-model,tokenized_requests=false",
           ] and "--tasks" in command and command[command.index("--tasks") + 1] == "hellaswag,gsm8k" and
+          ".lm-eval-cache" in command[command.index("--use_cache") + 1] and
           command[command.index("--limit") + 1] == "20" and
           command[command.index("--num_fewshot") + 1] == "0" and wrote)
 
