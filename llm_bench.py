@@ -21,7 +21,7 @@ The IQ suite has two generations of tasks:
 Verify all answers before benchmarking:  python verify_iq.py
 
 The optional lm-evaluation-harness suite requires its separate installation;
-see README.md. It runs standard tasks through the local server's chat API.
+see README.md. It runs standard tasks through the local server's completion API.
 
 Results are appended to results/<model>.jsonl (one JSON line per measurement or
 task metric) so you
@@ -979,7 +979,8 @@ def _lm_eval_rows(payload: dict, model: str, run_id: str,
 
 def run_lm_eval(base_url: str, model: str, results_dir: Path, tasks: str,
                 limit: int | None = None, num_fewshot: int | None = None,
-                experiment_id: str = "default") -> list[dict]:
+                experiment_id: str = "default",
+                backend: str = "completions") -> list[dict]:
     """Run the optional lm-evaluation-harness API backend and save its scores."""
     executable = shutil.which("lm-eval")
     if executable is None:
@@ -991,12 +992,22 @@ def run_lm_eval(base_url: str, model: str, results_dir: Path, tasks: str,
     run_id = uuid.uuid4().hex
     ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     endpoint = base_url.rstrip("/") + "/chat/completions"
+    harness_model = "local-chat-completions"
+    if backend == "completions":
+        endpoint = base_url.rstrip("/") + "/completions"
+        harness_model = "local-completions"
+    elif backend != "chat":
+        raise ValueError(f"unknown lm-eval backend: {backend}")
     tasks = ",".join(task.strip() for task in tasks.split(",") if task.strip())
     command = [
         executable,
         "run",
-        "--model", "local-chat-completions",
-        "--model_args", f"base_url={endpoint},model={model}",
+        "--model", harness_model,
+        # The local server accepts text prompts, not the token-ID arrays that
+        # lm-eval otherwise sends for log-likelihood requests. lm-eval still
+        # uses its tokenizer locally to locate the continuation tokens.
+        "--model_args",
+        f"base_url={endpoint},model={model},tokenized_requests=false",
         "--tasks", tasks,
     ]
     if limit is not None:
@@ -1062,6 +1073,8 @@ def main():
                     help="limit lm-evaluation-harness examples per task")
     ap.add_argument("--num-fewshot", type=nonnegative_int,
                     help="number of few-shot examples for lm-evaluation-harness")
+    ap.add_argument("--lm-eval-backend", choices=("completions", "chat"), default="completions",
+                    help="lm-eval API backend (default: completions; chat cannot run log-likelihood tasks)")
     ap.add_argument("--iq-tokens", type=positive_int, default=2048, help="max_tokens per IQ question (room for reasoning models)")
     ap.add_argument("--iq-categories", default="", help="comma-separated category filter, e.g. math-hard,retrieval (default: all)")
     ap.add_argument("--iq-runs", type=positive_int, default=1, help="repeat the IQ suite N times")
@@ -1104,7 +1117,7 @@ def main():
         elif suite == "lm-eval":
             try:
                 run_lm_eval(args.url, model, RESULTS_DIR, args.tasks, args.limit,
-                            args.num_fewshot, args.experiment_id)
+                            args.num_fewshot, args.experiment_id, args.lm_eval_backend)
             except RuntimeError as e:
                 ap.error(str(e))
         else:

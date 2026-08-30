@@ -93,7 +93,7 @@ python3 llm_bench.py --model your-model-id --iq --iq-tokens 4096
 
 ## Optional standard benchmarks: lm-evaluation-harness
 
-The project can also run tasks from [EleutherAI's lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) through your local OpenAI-compatible chat endpoint. This makes it possible to compare your local models with widely used standard tasks while keeping the built-in benchmark lightweight and dependency-free.
+The project can also run tasks from [EleutherAI's lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) through your local OpenAI-compatible completion endpoint. This makes it possible to compare your local models with widely used standard tasks while keeping the built-in benchmark lightweight and dependency-free.
 
 Install the optional dependency, then run one or more harness tasks:
 
@@ -113,7 +113,7 @@ python3 llm_bench.py \
   --model your-model-id
 ```
 
-The integration uses the harness `local-chat-completions` backend and maps `--url http://host:port/v1` to `/v1/chat/completions`. The harness writes task metrics into the same ignored per-model JSONL files. The dashboard shows the latest lm-eval results in a separate table; they are not mixed into the built-in IQ score or the combined speed/IQ ranking because they use different task definitions and scoring rules. Use the same task list, few-shot count, limit, server settings, and experiment ID when comparing models.
+The integration uses the harness `local-completions` backend by default and maps `--url http://host:port/v1` to `/v1/completions`. It sends decoded text prompts because many local servers reject token-ID arrays; lm-eval still uses the model tokenizer locally to align log-likelihoods. This is important for tasks such as `hellaswag`, which require token log-likelihoods; the chat backend cannot provide those. For generation-only tasks and servers that expose only chat completions, use `--lm-eval-backend chat`, which maps to `/v1/chat/completions`. The harness writes task metrics into the same ignored per-model JSONL files. The dashboard shows the latest lm-eval results in a separate table; they are not mixed into the built-in IQ score or the combined speed/IQ ranking because they use different task definitions and scoring rules. Use the same task list, few-shot count, limit, server settings, backend, and experiment ID when comparing models.
 
 The numeric options are positive where a count must be nonzero; `--num-fewshot` may be zero. The speed benchmark uses two short-prompt samples for each `--runs` iteration and one long-prompt sample per invocation.
 

@@ -86,8 +86,8 @@ def main():
         wrote = output.exists()
     check("lm-eval: invokes local chat backend with requested options",
           len(rows) == 2 and command[:6] == [
-              "/bin/lm-eval", "run", "--model", "local-chat-completions",
-              "--model_args", "base_url=http://localhost:11234/v1/chat/completions,model=test-model",
+              "/bin/lm-eval", "run", "--model", "local-completions",
+              "--model_args", "base_url=http://localhost:11234/v1/completions,model=test-model,tokenized_requests=false",
           ] and "--tasks" in command and command[command.index("--tasks") + 1] == "hellaswag,gsm8k" and
           command[command.index("--limit") + 1] == "20" and
           command[command.index("--num_fewshot") + 1] == "0" and wrote)
