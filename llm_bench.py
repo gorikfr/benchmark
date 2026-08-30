@@ -7,6 +7,7 @@ Usage:
   python llm_bench.py --model a/b --iq          # intelligence suite (accuracy)
   python llm_bench.py --model a/b --iq --iq-categories math-hard,retrieval
   python llm_bench.py --model a/b --iq --iq-runs 2   # repeat suite, averages out noise
+  python llm_bench.py --model a/b --experiment-id macbook-mlx-default
   python llm_bench.py --list                  # list models served by --url
   python llm_bench.py --url http://host:port/v1 ...
 
@@ -21,8 +22,8 @@ Verify all answers before benchmarking:  python verify_iq.py
 Results are appended to results/<model>.jsonl (one JSON line per run) so you
 can compare across models and over time. Speed token rates require the server
 to return streaming usage; otherwise token-based rates are left unavailable.
-Each benchmark invocation is tagged with a run_id so dashboard.html can group
-the latest run reliably.
+Each benchmark invocation is tagged with a run_id and experiment_id so
+dashboard.html can group comparable runs reliably.
 """
 
 import argparse
@@ -59,7 +60,7 @@ def list_models(base_url: str):
 
 
 def bench(base_url: str, model: str, prompt: str, max_tokens: int, label: str,
-          run_id: str | None = None) -> dict:
+          run_id: str | None = None, experiment_id: str | None = None) -> dict:
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -131,6 +132,8 @@ def bench(base_url: str, model: str, prompt: str, max_tokens: int, label: str,
     }
     if run_id is not None:
         result["run_id"] = run_id
+    if experiment_id is not None:
+        result["experiment_id"] = experiment_id
     print(f"[{model} | {label}] tokens={completion_tokens} ttft={result['ttft_s']}s "
           f"total={result['total_s']}s gen={result['gen_tps']} tok/s")
     return result
@@ -796,12 +799,13 @@ def add_binary(a, b):
 
 
 def run_iq(base_url: str, model: str, results_dir: Path, iq_tokens: int,
-           categories: set[str] | None = None) -> list[dict]:
+           categories: set[str] | None = None,
+           experiment_id: str = "default") -> list[dict]:
     tasks = IQ_TASKS if not categories else [t for t in IQ_TASKS if t["cat"] in categories]
     run_id = uuid.uuid4().hex
     print(f"\n=== {model} ===")
     print("--- warmup ---")
-    bench(base_url, model, SHORT_PROMPT, 32, "warmup", run_id)
+    bench(base_url, model, SHORT_PROMPT, 32, "warmup", run_id, experiment_id)
 
     # Each category tracks correct answers, evaluated answers, and request
     # failures separately. A transport/API failure is not a model mistake.
@@ -844,7 +848,8 @@ def run_iq(base_url: str, model: str, results_dir: Path, iq_tokens: int,
     for cat in sorted(tally):
         correct, evaluated, failed = tally[cat]
         rows.append({"model": model, "label": "iq", "category": cat,
-                     "ts": ts, "run_id": run_id, "correct": correct,
+                     "ts": ts, "run_id": run_id, "experiment_id": experiment_id,
+                     "correct": correct,
                      "total": evaluated, "attempted": evaluated + failed,
                      "failed": failed,
                      "accuracy": round(correct / evaluated, 3) if evaluated else None,
@@ -857,7 +862,8 @@ def run_iq(base_url: str, model: str, results_dir: Path, iq_tokens: int,
         else:
             all_tokens_known = False
     rows.append({"model": model, "label": "iq-total", "ts": ts,
-                 "run_id": run_id, "correct": tot[0], "total": tot[1],
+                 "run_id": run_id, "experiment_id": experiment_id,
+                 "correct": tot[0], "total": tot[1],
                  "attempted": tot[1] + tot[2], "failed": tot[2],
                  "accuracy": round(tot[0] / tot[1], 3) if tot[1] else None,
                  "tokens": tot[3] if tot[1] and all_tokens_known else None})
@@ -878,18 +884,19 @@ def run_iq(base_url: str, model: str, results_dir: Path, iq_tokens: int,
     return rows
 
 
-def run_model(base_url: str, model: str, runs: int, results_dir: Path) -> list[dict]:
+def run_model(base_url: str, model: str, runs: int, results_dir: Path,
+              experiment_id: str = "default") -> list[dict]:
     results = []
     run_id = uuid.uuid4().hex
     print(f"\n=== {model} ===")
     print("--- warmup ---")
-    bench(base_url, model, SHORT_PROMPT, 32, "warmup", run_id)
+    bench(base_url, model, SHORT_PROMPT, 32, "warmup", run_id, experiment_id)
     for i in range(1, runs + 1):
         print(f"--- generation speed (short prompt, run {i}/{runs}) ---")
-        results.append(bench(base_url, model, SHORT_PROMPT, 512, "gen", run_id))
-        results.append(bench(base_url, model, SHORT_PROMPT, 512, "gen", run_id))
+        results.append(bench(base_url, model, SHORT_PROMPT, 512, "gen", run_id, experiment_id))
+        results.append(bench(base_url, model, SHORT_PROMPT, 512, "gen", run_id, experiment_id))
     print("--- prefill + decode (long ~2800-token prompt) ---")
-    results.append(bench(base_url, model, LONG_PROMPT, 256, "long-prompt", run_id))
+    results.append(bench(base_url, model, LONG_PROMPT, 256, "long-prompt", run_id, experiment_id))
 
     results_dir.mkdir(exist_ok=True)
     out = results_dir / (model.replace("/", "__") + ".jsonl")
@@ -919,6 +926,8 @@ def main():
     ap.add_argument("--iq-tokens", type=positive_int, default=2048, help="max_tokens per IQ question (room for reasoning models)")
     ap.add_argument("--iq-categories", default="", help="comma-separated category filter, e.g. math-hard,retrieval (default: all)")
     ap.add_argument("--iq-runs", type=positive_int, default=1, help="repeat the IQ suite N times")
+    ap.add_argument("--experiment-id", default="default",
+                    help="comparable-run group; change it when hardware or server settings change")
     ap.add_argument("--list", action="store_true", help="list models served by --url and exit")
     ap.add_argument("--index", action="store_true", help="rebuild results.json index for dashboard.html")
     args = ap.parse_args()
@@ -945,9 +954,9 @@ def main():
                 if unknown:
                     ap.error(f"unknown --iq-categories {unknown}; known: {sorted(known)}")
             for _ in range(args.iq_runs):
-                run_iq(args.url, model, RESULTS_DIR, args.iq_tokens, cats)
+                run_iq(args.url, model, RESULTS_DIR, args.iq_tokens, cats, args.experiment_id)
         else:
-            run_model(args.url, model, args.runs, RESULTS_DIR)
+            run_model(args.url, model, args.runs, RESULTS_DIR, args.experiment_id)
     RESULTS_DIR.mkdir(exist_ok=True)
     files = sorted(p.name for p in RESULTS_DIR.glob("*.jsonl"))
     (RESULTS_DIR.parent / "results.json").write_text(json.dumps(files))

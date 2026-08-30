@@ -23,7 +23,8 @@
 <h1>LLM Bench</h1>
 <p class="hint">Loads <code>results/*.jsonl</code> — run <code>python llm_bench.py --model &lt;id&gt;</code>
 (add <code>--iq</code> for intelligence scores) then refresh this page.
-Best value per column highlighted. Only the latest benchmark run per model is shown (earlier runs listed below).
+Best value per column highlighted. The combined ranking averages valid runs within the selected experiment;
+the latest benchmark run and earlier runs are shown below.
 Token rates are shown only when the server reports authoritative usage.</p>
 <div id="content">No results/ directory or files found. (Open this file from the repo root via a local server, e.g. <code>python -m http.server</code>.)</div>
 
@@ -54,6 +55,18 @@ async function loadResults() {
 }
 
 function fmt(v, d = 2) { return v == null ? "—" : Number(v).toFixed(d); }
+
+function experimentId(r) { return r.experiment_id || "legacy"; }
+
+function latestExperimentId(runs) {
+  const latest = {};
+  for (const r of runs) {
+    const id = experimentId(r);
+    const ts = Date.parse(r.ts);
+    latest[id] = Math.max(latest[id] ?? 0, Number.isFinite(ts) ? ts : 0);
+  }
+  return Object.entries(latest).sort((a, b) => b[1] - a[1])[0]?.[0] || "default";
+}
 
 // Combined score: IQ contributes 50%, and the available speed metrics share the
 // other 50%. Missing speed metrics are omitted from the speed sub-score, but a
@@ -142,9 +155,13 @@ function iqSection(iqRuns) {
   return frag;
 }
 
-function render(runs) {
-  const speed = runs.filter(r => r.label !== "iq" && r.label !== "iq-total");
-  const iqRuns = runs.filter(r => r.label === "iq" || r.label === "iq-total");
+function render(runs, selectedExperiment = null) {
+  const experiments = [...new Set(runs.map(experimentId))];
+  const activeExperiment = selectedExperiment && experiments.includes(selectedExperiment)
+    ? selectedExperiment : latestExperimentId(runs);
+  const viewRuns = runs.filter(r => experimentId(r) === activeExperiment);
+  const speed = viewRuns.filter(r => r.label !== "iq" && r.label !== "iq-total");
+  const iqRuns = viewRuns.filter(r => r.label === "iq" || r.label === "iq-total");
   const byModel = {};
   for (const r of speed) (byModel[r.model] ||= []).push(r);
 
@@ -167,10 +184,58 @@ function render(runs) {
     return v.length ? v.reduce((a, b) => a + b) / v.length : null;
   }
 
+  function aggregateSpeed(rs) {
+    const groups = new Map();
+    for (const r of rs) {
+      const key = r.run_id ? `run:${r.run_id}` : "legacy";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    }
+    const validRuns = [...groups.values()]
+      .map(group => {
+        const gen = group.filter(r => r.label === "gen");
+        const long = group.filter(r => r.label === "long-prompt");
+        if (!gen.length || !long.length) return null;
+        return {
+          gen_tps: avgOf(gen, "gen_tps"),
+          ttft_s: avgOf(gen, "ttft_s"),
+          long_gen_tps: avgOf(long, "gen_tps"),
+        };
+      })
+      .filter(Boolean);
+    return {
+      gen_tps: avgOf(validRuns, "gen_tps"),
+      ttft_s: avgOf(validRuns, "ttft_s"),
+      long_gen_tps: avgOf(validRuns, "long_gen_tps"),
+      runs: validRuns.length,
+    };
+  }
+
+  function aggregateIq(rs) {
+    const totals = new Map();
+    for (const r of rs.filter(r => r.label === "iq-total")) {
+      const key = r.run_id ? `run:${r.run_id}` : `legacy:${r.ts}`;
+      totals.set(key, r);
+    }
+    let correct = 0, total = 0, runs = 0;
+    for (const r of totals.values()) {
+      const failed = Number(r.failed ?? 0);
+      const evaluated = Number(r.total);
+      const answers = Number(r.correct);
+      if (failed || !Number.isFinite(evaluated) || evaluated <= 0 ||
+          !Number.isFinite(answers)) continue;
+      correct += answers;
+      total += evaluated;
+      runs++;
+    }
+    return { accuracy: total ? correct / total : null, total, runs };
+  }
+
   // latest benchmark run per model, split by label
   const speedRows = Object.fromEntries(models.map(m => [
     m, { gen: latestRunRows(rounds[m]).filter(r => r.label === "gen"),
          long: latestRunRows(rounds[m]).filter(r => r.label === "long-prompt") }]));
+  const speedAggregates = Object.fromEntries(models.map(m => [m, aggregateSpeed(rounds[m])]));
 
   function table(getRows) {
     // getRows(model) -> array of run objects for that model; one table per label
@@ -223,23 +288,23 @@ function render(runs) {
   }
 
   function combinedTable() {
-    // latest IQ total per model + latest speed benchmark run per model
-    const iqTotals = {};
+    // Aggregate valid IQ suites and speed invocations within the selected experiment.
+    const iqAggregates = {};
     for (const [m, rs] of Object.entries(iqByModel())) {
-      const cur = latestIqRows(rs);
-      const tot = [...cur].reverse().find(r => r.label === "iq-total");
-      if (tot) iqTotals[m] = tot;
+      iqAggregates[m] = aggregateIq(rs);
     }
     const stats = {};
-    for (const m of new Set([...Object.keys(iqTotals), ...models])) {
-      const gen = speedRows[m]?.gen || [];
-      const long = speedRows[m]?.long || [];
+    for (const m of new Set([...Object.keys(iqAggregates), ...models])) {
+      const speedAggregate = speedAggregates[m] || {};
+      const iqAggregate = iqAggregates[m] || {};
       stats[m] = {
-        iq: iqTotals[m]?.accuracy ?? null,
-        gen_tps: avgOf(gen, "gen_tps"),
-        ttft_s: avgOf(gen, "ttft_s"),
-        long_gen_tps: avgOf(long, "gen_tps"),
-        tasks: iqTotals[m]?.total ?? null,
+        iq: iqAggregate.accuracy ?? null,
+        gen_tps: speedAggregate.gen_tps ?? null,
+        ttft_s: speedAggregate.ttft_s ?? null,
+        long_gen_tps: speedAggregate.long_gen_tps ?? null,
+        tasks: iqAggregate.total ?? null,
+        iq_runs: iqAggregate.runs ?? 0,
+        speed_runs: speedAggregate.runs ?? 0,
       };
     }
     const peers = Object.values(stats);
@@ -248,17 +313,18 @@ function render(runs) {
     if (!rows.some(([, s]) => sc(s) != null)) {
       const p = document.createElement("p");
       p.className = "hint";
-      p.textContent = "Need at least one speed run and one --iq run for a model to enter the combined ranking.";
+      p.textContent = "Need at least one valid speed run and one complete --iq run in this experiment for a model to enter the combined ranking.";
       return p;
     }
-    const head = ["model", "score", "iq", "gen tok/s", "TTFT (s)", "long gen tok/s"];
+    const head = ["model", "score", "IQ / speed runs", "iq", "gen tok/s", "TTFT (s)", "long gen tok/s"];
     let html = "<tr>" + head.map(h => `<th>${h}</th>`).join("") + "</tr>";
     for (const [m, s] of rows) {
       const v = sc(s);
       html += `<tr><td>${m}</td>` +
       `<td>${v == null ? "—" : `<b>${(v * 100).toFixed(1)}</b>`}` +
         `<span class="bar" data-score="${v ?? ""}" style="width:${v == null ? 0 : Math.round(v * 100)}px"></span></td>` +
-        `<td title="${s.tasks ?? 0} tasks">${s.iq == null ? "—" : (s.iq * 100).toFixed(0) + "%"}</td>` +
+        `<td>${s.iq_runs} / ${s.speed_runs}</td>` +
+        `<td title="${s.tasks ?? 0} evaluated tasks">${s.iq == null ? "—" : (s.iq * 100).toFixed(0) + "%"}</td>` +
         `<td>${fmt(s.gen_tps, 1)}</td><td>${fmt(s.ttft_s)}</td><td>${fmt(s.long_gen_tps, 1)}</td></tr>`;
     }
     const t = document.createElement("table");
@@ -278,10 +344,29 @@ function render(runs) {
   const content = document.getElementById("content");
   content.innerHTML = "";
 
+  if (experiments.length) {
+    const controls = document.createElement("p");
+    controls.className = "hint";
+    const label = document.createElement("label");
+    label.textContent = "Experiment: ";
+    const select = document.createElement("select");
+    for (const id of experiments) {
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = id;
+      option.selected = id === activeExperiment;
+      select.append(option);
+    }
+    select.addEventListener("change", () => render(runs, select.value));
+    label.append(select);
+    controls.append(label);
+    content.append(controls);
+  }
+
   const iq = iqSection(iqRuns);
   if (iq) content.append(iq);
 
-  content.append(h1("Combined ranking (intelligence + speed, equal weight)"));
+  content.append(h1("Combined ranking (average of comparable runs; intelligence + speed, equal weight)"));
   content.append(combinedTable());
 
   content.append(h1("Latest benchmark run (averaged per label)"));
@@ -297,7 +382,7 @@ function render(runs) {
     content.append(t);
   });
 
-  content.append(h1("All runs"));
+  content.append(h1("All runs in selected experiment"));
   const all = document.createElement("table");
   all.innerHTML = "<tr><th>model</th><th>when</th><th>label</th><th>tokens</th><th>TTFT (s)</th><th>gen tok/s</th><th>prefill tok/s</th><th>total (s)</th></tr>" +
     speed.map(r => `<tr><td>${r.model}</td><td>${(r.ts || "").slice(11, 19)}</td><td>${r.label}</td>

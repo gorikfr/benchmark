@@ -50,6 +50,9 @@ def main():
     check("request failures: excluded from evaluated total",
           math_row["correct"] == 1 and math_row["total"] == 1 and
           math_row["failed"] == 10 and math_row["attempted"] == 11)
+    check("results: run and experiment IDs are recorded",
+          all(r["run_id"] for r in rows) and
+          all(r["experiment_id"] == "default" for r in rows))
 
     with TemporaryDirectory() as tmp, patch("llm_bench.bench", return_value={}), \
             patch("llm_bench.ask", side_effect=RuntimeError("offline")):

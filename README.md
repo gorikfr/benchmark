@@ -60,6 +60,12 @@ python3 llm_bench.py \
   --url http://127.0.0.1:8000/v1 \
   --model your-model-id
 
+# Put runs with the same hardware/server configuration in one experiment.
+python3 llm_bench.py \
+  --experiment-id macbook-mlx-default \
+  --model your-model-id \
+  --runs 3
+
 # Compare multiple models in one invocation.
 python3 llm_bench.py \
   --model model-a \
@@ -97,7 +103,7 @@ Open [http://localhost:8001/dashboard.html](http://localhost:8001/dashboard.html
 python3 llm_bench.py --index
 ```
 
-The dashboard shows the latest benchmark run per model, historical runs, IQ category scores, and a combined ranking. The combined ranking gives IQ accuracy 50% of the score and the available speed metrics the other 50%; a model needs both IQ and speed data to receive a combined score.
+The dashboard lets you select an experiment, shows the latest benchmark run and historical runs within it, and displays IQ category scores. The combined ranking averages valid run-level summaries across the selected experiment. It gives IQ accuracy 50% of the score and the available speed metrics the other 50%; a model needs both IQ and speed data to receive a combined score. Use a different `--experiment-id` whenever hardware, model settings, server settings, or benchmark code changes materially.
 
 ## Reproducibility tips
 
