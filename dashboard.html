@@ -155,12 +155,32 @@ function iqSection(iqRuns) {
   return frag;
 }
 
+function lmEvalSection(lmRuns) {
+  if (!lmRuns.length) return null;
+  const byModel = {};
+  for (const r of lmRuns) (byModel[r.model] ||= []).push(r);
+  const rows = [];
+  for (const rs of Object.values(byModel)) {
+    rows.push(...latestRunRows(rs));
+  }
+  rows.sort((a, b) => a.model.localeCompare(b.model) ||
+    a.task.localeCompare(b.task) || a.metric.localeCompare(b.metric));
+  const table = document.createElement("table");
+  table.innerHTML = "<tr><th>model</th><th>task</th><th>metric</th><th>value</th><th>stderr</th></tr>" +
+    rows.map(r => `<tr><td>${r.model}</td><td>${r.task}</td><td>${r.metric}</td>` +
+      `<td>${fmt(r.value, 4)}</td><td>${fmt(r.stderr, 4)}</td></tr>`).join("");
+  const frag = document.createDocumentFragment();
+  frag.append(h1("lm-evaluation-harness (latest run)"), table);
+  return frag;
+}
+
 function render(runs, selectedExperiment = null) {
   const experiments = [...new Set(runs.map(experimentId))];
   const activeExperiment = selectedExperiment && experiments.includes(selectedExperiment)
     ? selectedExperiment : latestExperimentId(runs);
   const viewRuns = runs.filter(r => experimentId(r) === activeExperiment);
-  const speed = viewRuns.filter(r => r.label !== "iq" && r.label !== "iq-total");
+  const lmRuns = viewRuns.filter(r => r.label === "lm-eval");
+  const speed = viewRuns.filter(r => r.label !== "iq" && r.label !== "iq-total" && r.label !== "lm-eval");
   const iqRuns = viewRuns.filter(r => r.label === "iq" || r.label === "iq-total");
   const byModel = {};
   for (const r of speed) (byModel[r.model] ||= []).push(r);
@@ -365,6 +385,8 @@ function render(runs, selectedExperiment = null) {
 
   const iq = iqSection(iqRuns);
   if (iq) content.append(iq);
+  const lmEval = lmEvalSection(lmRuns);
+  if (lmEval) content.append(lmEval);
 
   content.append(h1("Combined ranking (average of comparable runs; intelligence + speed, equal weight)"));
   content.append(combinedTable());

@@ -7,6 +7,7 @@ Usage:
   python llm_bench.py --model a/b --iq          # intelligence suite (accuracy)
   python llm_bench.py --model a/b --iq --iq-categories math-hard,retrieval
   python llm_bench.py --model a/b --iq --iq-runs 2   # repeat suite, averages out noise
+  python llm_bench.py --suite lm-eval --tasks hellaswag --model a/b
   python llm_bench.py --model a/b --experiment-id macbook-mlx-default
   python llm_bench.py --list                  # list models served by --url
   python llm_bench.py --url http://host:port/v1 ...
@@ -19,7 +20,11 @@ The IQ suite has two generations of tasks:
 
 Verify all answers before benchmarking:  python verify_iq.py
 
-Results are appended to results/<model>.jsonl (one JSON line per run) so you
+The optional lm-evaluation-harness suite requires its separate installation;
+see README.md. It runs standard tasks through the local server's chat API.
+
+Results are appended to results/<model>.jsonl (one JSON line per measurement or
+task metric) so you
 can compare across models and over time. Speed token rates require the server
 to return streaming usage; otherwise token-based rates are left unavailable.
 Each benchmark invocation is tagged with a run_id and experiment_id so
@@ -32,6 +37,7 @@ import math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -907,6 +913,121 @@ def run_model(base_url: str, model: str, runs: int, results_dir: Path,
     return results
 
 
+def _lm_eval_result_payload(output_dir: Path) -> dict:
+    """Find the JSON result written by lm-evaluation-harness."""
+    candidates = []
+    for path in output_dir.rglob("*.json"):
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("results"), dict):
+            candidates.append((path, payload))
+    if not candidates:
+        raise RuntimeError(f"lm-eval produced no result JSON in {output_dir}")
+    return max(candidates, key=lambda item: item[0].stat().st_mtime_ns)[1]
+
+
+def _lm_eval_stderr_key(metric: str, metrics: dict) -> str | None:
+    base, separator, suffix = metric.partition(",")
+    candidates = [
+        f"{base}_stderr{separator}{suffix}" if separator else f"{base}_stderr",
+        f"{base}_stderr",
+    ]
+    return next((key for key in candidates if key in metrics), None)
+
+
+def _lm_eval_rows(payload: dict, model: str, run_id: str,
+                  experiment_id: str, ts: str) -> list[dict]:
+    """Normalize lm-eval's task/metric map into dashboard-friendly JSONL rows."""
+    rows = []
+    higher_is_better = payload.get("higher_is_better") or {}
+    for task, metrics in payload.get("results", {}).items():
+        if not isinstance(metrics, dict):
+            continue
+        task_higher = higher_is_better.get(task, {})
+        if not isinstance(task_higher, dict):
+            task_higher = {}
+        for metric, value in metrics.items():
+            if metric.endswith("_stderr") or "_stderr," in metric:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if not math.isfinite(float(value)):
+                continue
+            stderr_key = _lm_eval_stderr_key(metric, metrics)
+            stderr = metrics.get(stderr_key) if stderr_key else None
+            if isinstance(stderr, bool) or not isinstance(stderr, (int, float)):
+                stderr = None
+            rows.append({
+                "model": model,
+                "label": "lm-eval",
+                "suite": "lm-evaluation-harness",
+                "task": task,
+                "metric": metric,
+                "value": value,
+                "stderr": stderr,
+                "higher_is_better": task_higher.get(metric),
+                "ts": ts,
+                "run_id": run_id,
+                "experiment_id": experiment_id,
+            })
+    if not rows:
+        raise RuntimeError("lm-eval result JSON contained no numeric task metrics")
+    return rows
+
+
+def run_lm_eval(base_url: str, model: str, results_dir: Path, tasks: str,
+                limit: int | None = None, num_fewshot: int | None = None,
+                experiment_id: str = "default") -> list[dict]:
+    """Run the optional lm-evaluation-harness API backend and save its scores."""
+    executable = shutil.which("lm-eval")
+    if executable is None:
+        raise RuntimeError(
+            "lm-eval is not installed; install it with: "
+            "python3 -m pip install 'lm-eval[api]'"
+        )
+
+    run_id = uuid.uuid4().hex
+    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+    tasks = ",".join(task.strip() for task in tasks.split(",") if task.strip())
+    command = [
+        executable,
+        "run",
+        "--model", "local-chat-completions",
+        "--model_args", f"base_url={endpoint},model={model}",
+        "--tasks", tasks,
+    ]
+    if limit is not None:
+        command.extend(["--limit", str(limit)])
+    if num_fewshot is not None:
+        command.extend(["--num_fewshot", str(num_fewshot)])
+
+    print(f"\n=== {model} | lm-evaluation-harness ===")
+    print("command:", " ".join(command))
+    with tempfile.TemporaryDirectory(prefix="lm-eval-") as temp_dir:
+        command.extend(["--output_path", temp_dir])
+        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+        if completed.stdout:
+            print(completed.stdout, end="")
+        if completed.returncode:
+            details = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(
+                f"lm-eval failed with exit code {completed.returncode}: {details[-2000:]}"
+            )
+        payload = _lm_eval_result_payload(Path(temp_dir))
+
+    rows = _lm_eval_rows(payload, model, run_id, experiment_id, ts)
+    results_dir.mkdir(exist_ok=True)
+    out = results_dir / (model.replace("/", "__") + ".jsonl")
+    with out.open("a") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    print(f"saved {len(rows)} lm-eval metric rows -> {out}")
+    return rows
+
+
 def positive_int(value: str) -> int:
     try:
         number = int(value)
@@ -917,12 +1038,30 @@ def positive_int(value: str) -> int:
     return number
 
 
+def nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("must be an integer") from e
+    if number < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return number
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", action="append", default=[], help="model id(s); repeatable; omit with --list")
     ap.add_argument("--url", default="http://localhost:11234/v1", help="OpenAI-compatible base URL")
     ap.add_argument("--runs", type=positive_int, default=1, help="repeat short-prompt round (default 1)")
     ap.add_argument("--iq", action="store_true", help="run the intelligence suite (accuracy) instead of speed tests")
+    ap.add_argument("--suite", choices=("speed", "iq", "lm-eval"),
+                    help="benchmark suite; --iq is retained as a shortcut for --suite iq")
+    ap.add_argument("--tasks", default="hellaswag",
+                    help="comma-separated lm-evaluation-harness tasks (default: hellaswag)")
+    ap.add_argument("--limit", type=positive_int,
+                    help="limit lm-evaluation-harness examples per task")
+    ap.add_argument("--num-fewshot", type=nonnegative_int,
+                    help="number of few-shot examples for lm-evaluation-harness")
     ap.add_argument("--iq-tokens", type=positive_int, default=2048, help="max_tokens per IQ question (room for reasoning models)")
     ap.add_argument("--iq-categories", default="", help="comma-separated category filter, e.g. math-hard,retrieval (default: all)")
     ap.add_argument("--iq-runs", type=positive_int, default=1, help="repeat the IQ suite N times")
@@ -944,9 +1083,16 @@ def main():
         return
     if not args.model:
         ap.error("give --model (repeatable) or --list")
+    if args.iq and args.suite:
+        ap.error("use either --iq or --suite, not both")
+    suite = args.suite or ("iq" if args.iq else "speed")
+    if suite == "lm-eval" and not {task.strip() for task in args.tasks.split(",") if task.strip()}:
+        ap.error("--tasks must contain at least one task for --suite lm-eval")
+    if suite != "iq" and args.iq_categories:
+        ap.error("--iq-categories requires --iq or --suite iq")
 
     for model in args.model:
-        if args.iq:
+        if suite == "iq":
             cats = {c.strip() for c in args.iq_categories.split(",") if c.strip()} or None
             if cats:
                 known = {t["cat"] for t in IQ_TASKS}
@@ -955,6 +1101,12 @@ def main():
                     ap.error(f"unknown --iq-categories {unknown}; known: {sorted(known)}")
             for _ in range(args.iq_runs):
                 run_iq(args.url, model, RESULTS_DIR, args.iq_tokens, cats, args.experiment_id)
+        elif suite == "lm-eval":
+            try:
+                run_lm_eval(args.url, model, RESULTS_DIR, args.tasks, args.limit,
+                            args.num_fewshot, args.experiment_id)
+            except RuntimeError as e:
+                ap.error(str(e))
         else:
             run_model(args.url, model, args.runs, RESULTS_DIR, args.experiment_id)
     RESULTS_DIR.mkdir(exist_ok=True)

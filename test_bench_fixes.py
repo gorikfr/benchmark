@@ -1,9 +1,10 @@
 """Regression checks for benchmark parsing and result handling."""
 from pathlib import Path
+from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from llm_bench import _extract_number, run_iq, score_task
+from llm_bench import _extract_number, _lm_eval_rows, run_iq, run_lm_eval, score_task
 
 CODE = {"kind": "code", "tests": [("add(2, 3)", repr(5)), ("add(-4, 1)", repr(-3))]}
 
@@ -53,6 +54,43 @@ def main():
     check("results: run and experiment IDs are recorded",
           all(r["run_id"] for r in rows) and
           all(r["experiment_id"] == "default" for r in rows))
+
+    lm_payload = {
+        "results": {
+            "hellaswag": {
+                "acc,none": 0.625,
+                "acc_stderr,none": 0.041,
+                "alias": "hellaswag",
+            },
+            "gsm8k": {"exact_match,flexible-extract": 0.5},
+        },
+        "higher_is_better": {
+            "hellaswag": {"acc,none": True},
+            "gsm8k": {"exact_match,flexible-extract": True},
+        },
+    }
+    lm_rows = _lm_eval_rows(lm_payload, "test-model", "run-1", "exp-1", "now")
+    hellaswag = next(r for r in lm_rows if r["task"] == "hellaswag")
+    check("lm-eval: numeric metrics are normalized",
+          len(lm_rows) == 2 and hellaswag["value"] == 0.625 and
+          hellaswag["stderr"] == 0.041 and hellaswag["suite"] == "lm-evaluation-harness" and
+          all(r["run_id"] == "run-1" and r["experiment_id"] == "exp-1" for r in lm_rows))
+
+    with TemporaryDirectory() as tmp, patch("llm_bench.shutil.which", return_value="/bin/lm-eval"), \
+            patch("llm_bench.subprocess.run", return_value=CompletedProcess([], 0, "done\n", "")) as run, \
+            patch("llm_bench._lm_eval_result_payload", return_value=lm_payload):
+        rows = run_lm_eval("http://localhost:11234/v1", "test-model", Path(tmp),
+                           "hellaswag, gsm8k", limit=20, num_fewshot=0, experiment_id="exp-1")
+        command = run.call_args.args[0]
+        output = Path(tmp) / "test-model.jsonl"
+        wrote = output.exists()
+    check("lm-eval: invokes local chat backend with requested options",
+          len(rows) == 2 and command[:6] == [
+              "/bin/lm-eval", "run", "--model", "local-chat-completions",
+              "--model_args", "base_url=http://localhost:11234/v1/chat/completions,model=test-model",
+          ] and "--tasks" in command and command[command.index("--tasks") + 1] == "hellaswag,gsm8k" and
+          command[command.index("--limit") + 1] == "20" and
+          command[command.index("--num_fewshot") + 1] == "0" and wrote)
 
     with TemporaryDirectory() as tmp, patch("llm_bench.bench", return_value={}), \
             patch("llm_bench.ask", side_effect=RuntimeError("offline")):

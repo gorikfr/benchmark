@@ -29,6 +29,12 @@ The suite is useful as a quick regression signal, but it is not a complete measu
 - A local or reachable OpenAI-compatible server exposing `/v1/models` and `/v1/chat/completions`
 - No third-party Python packages are required by the benchmark scripts
 
+The optional `lm-evaluation-harness` integration has its own dependency. Install it only if you want to run standard academic task suites:
+
+```bash
+python3 -m pip install -r requirements-lm-eval.txt
+```
+
 The default server URL is `http://localhost:11234/v1`. Start your preferred local inference server separately and make sure it supports streaming chat completions. For accurate token-based speed metrics, the server should return streaming `usage` data when requested; otherwise token counts and token rates are shown as unavailable rather than estimated.
 
 ## Quick start
@@ -85,7 +91,31 @@ python3 llm_bench.py \
 python3 llm_bench.py --model your-model-id --iq --iq-tokens 4096
 ```
 
-The numeric options must be positive. The speed benchmark uses two short-prompt samples for each `--runs` iteration and one long-prompt sample per invocation.
+## Optional standard benchmarks: lm-evaluation-harness
+
+The project can also run tasks from [EleutherAI's lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) through your local OpenAI-compatible chat endpoint. This makes it possible to compare your local models with widely used standard tasks while keeping the built-in benchmark lightweight and dependency-free.
+
+Install the optional dependency, then run one or more harness tasks:
+
+```bash
+python3 -m pip install -r requirements-lm-eval.txt
+python3 llm_bench.py \
+  --suite lm-eval \
+  --tasks hellaswag \
+  --model your-model-id
+
+# Multiple tasks, a small smoke test, and explicit few-shot setting.
+python3 llm_bench.py \
+  --suite lm-eval \
+  --tasks mmlu,gsm8k \
+  --limit 20 \
+  --num-fewshot 0 \
+  --model your-model-id
+```
+
+The integration uses the harness `local-chat-completions` backend and maps `--url http://host:port/v1` to `/v1/chat/completions`. The harness writes task metrics into the same ignored per-model JSONL files. The dashboard shows the latest lm-eval results in a separate table; they are not mixed into the built-in IQ score or the combined speed/IQ ranking because they use different task definitions and scoring rules. Use the same task list, few-shot count, limit, server settings, and experiment ID when comparing models.
+
+The numeric options are positive where a count must be nonzero; `--num-fewshot` may be zero. The speed benchmark uses two short-prompt samples for each `--runs` iteration and one long-prompt sample per invocation.
 
 ## Viewing results
 
