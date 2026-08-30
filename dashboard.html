@@ -17,6 +17,15 @@
   .bad { color: #777; }
   code { background: #222; padding: .1rem .35rem; border-radius: 4px; }
   .bar { display: inline-block; height: 8px; background: #4a90d9; border-radius: 2px; vertical-align: middle; margin-left: .5rem; }
+  .guide { background: #171c25; border: 1px solid #303949; border-radius: 8px; padding: 1rem 1.2rem; margin: 1rem 0 1.5rem; }
+  .guide summary { cursor: pointer; color: #b9d7ff; font-weight: 600; }
+  .guide h2 { font-size: 1rem; margin: 1rem 0 .35rem; }
+  .guide p { margin: .4rem 0; }
+  .guide table { margin: .6rem 0 0; }
+  .guide th, .guide td { text-align: left; vertical-align: top; }
+  .guide th:nth-child(1), .guide td:nth-child(1) { width: 18%; }
+  .guide th:nth-child(2), .guide td:nth-child(2) { width: 18%; }
+  .guide .good { color: #7fd07f; }
 </style>
 </head>
 <body>
@@ -26,6 +35,33 @@
 Best value per column highlighted. The combined ranking averages valid runs within the selected experiment;
 the latest benchmark run and earlier runs are shown below.
 Token rates are shown only when the server reports authoritative usage.</p>
+<details class="guide" open>
+  <summary>How to interpret these results</summary>
+  <p>Use this dashboard to compare models on the same machine, server settings, prompt, and experiment. A faster model is not automatically a better model: first check whether it gives acceptable answers, then choose the speed profile that matches your workload.</p>
+
+  <h2>What do “gen” and “long prompt” mean?</h2>
+  <table>
+    <tr><th>Benchmark</th><th>What it stresses</th><th>How to read it</th></tr>
+    <tr><td><b>gen</b></td><td>Two short, warmed-up requests that generate an answer.</td><td>Mostly reflects output/decode speed for an ordinary interactive response.</td></tr>
+    <tr><td><b>long prompt</b></td><td>One request with roughly 2,800 input tokens before generating a shorter answer.</td><td>Shows how the model behaves when it must first process a large context, such as a document or RAG prompt.</td></tr>
+  </table>
+
+  <h2>Metric glossary</h2>
+  <table>
+    <tr><th>Metric</th><th>Better</th><th>Meaning</th></tr>
+    <tr><td><b>gen tok/s</b></td><td class="good">Higher</td><td>Output tokens generated per second after the first token. This is the main “how fast does text stream?” metric.</td></tr>
+    <tr><td><b>prefill tok/s</b></td><td class="good">Higher</td><td>Directional estimate of how quickly the input prompt is processed, calculated from prompt tokens and TTFT. It is useful for comparing runs, but TTFT also includes scheduling and other request overhead.</td></tr>
+    <tr><td><b>TTFT</b></td><td class="good">Lower</td><td>Time to first token: how long you wait before any answer appears. It includes request, queueing, prompt-processing, and server overhead—not just model computation.</td></tr>
+    <tr><td><b>total (s)</b></td><td class="good">Lower</td><td>Total time until the response finishes. It depends heavily on the number of output tokens, so compare it only when prompts and output limits are comparable.</td></tr>
+    <tr><td><b>IQ / task score</b></td><td class="good">Higher</td><td>Accuracy on the fixed machine-scored tasks. Request failures are excluded from the accuracy denominator and shown separately; a missing score is not a zero.</td></tr>
+  </table>
+
+  <h2>Which metrics matter most?</h2>
+  <p><b>For interactive chat:</b> prioritize task quality, then <b>TTFT</b> for responsiveness and <b>gen tok/s</b> for smooth streaming.</p>
+  <p><b>For long documents or RAG:</b> prioritize task quality, then <b>TTFT</b> and the long-prompt row’s <b>prefill tok/s</b>.</p>
+  <p><b>For batch jobs:</b> prioritize task quality and <b>gen tok/s</b>; use total time when every model produces similarly sized outputs.</p>
+  <p>The combined ranking gives quality and speed equal weight after normalizing speed across the selected experiment. Treat it as a convenience summary, not a universal truth. Compare averages across several runs, and do not compare results from different experiment IDs unless the hardware and server configuration are equivalent.</p>
+</details>
 <div id="content">No results/ directory or files found. (Open this file from the repo root via a local server, e.g. <code>python -m http.server</code>.)</div>
 
 <script>
