@@ -13,6 +13,7 @@ from llm_bench import (
     run_lm_eval,
     score_task,
 )
+from lm_eval_compat import response_has_logprobs
 
 CODE = {"kind": "code", "tests": [("add(2, 3)", repr(5)), ("add(-4, 1)", repr(-3))]}
 
@@ -83,6 +84,9 @@ def main():
           len(lm_rows) == 2 and hellaswag["value"] == 0.625 and
           hellaswag["stderr"] == 0.041 and hellaswag["suite"] == "lm-evaluation-harness" and
           all(r["run_id"] == "run-1" and r["experiment_id"] == "exp-1" for r in lm_rows))
+    check("lm-eval: null logprobs are detectable",
+          response_has_logprobs({"choices": [{"logprobs": {"token_logprobs": []}}]}) and
+          not response_has_logprobs({"choices": [{"logprobs": None}]}))
 
     with TemporaryDirectory() as tmp, patch("llm_bench.shutil.which", return_value="/bin/lm-eval"), \
             patch("llm_bench.subprocess.run", return_value=CompletedProcess([], 0, "done\n", "")) as run, \
@@ -93,7 +97,7 @@ def main():
         output = Path(tmp) / "test-model.jsonl"
         wrote = output.exists()
     check("lm-eval: invokes local backend with requested options and checkpointing",
-          len(rows) == 2 and command[:6] == [
+          len(rows) == 2 and command[3:9] == [
               "/bin/lm-eval", "run", "--model", "local-completions",
               "--model_args", "base_url=http://localhost:11234/v1/completions,model=test-model,tokenized_requests=false",
           ] and "--tasks" in command and command[command.index("--tasks") + 1] == "hellaswag,gsm8k" and

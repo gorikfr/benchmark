@@ -1035,6 +1035,19 @@ def _lm_eval_cache_path(results_dir: Path, base_url: str, model: str,
     return results_dir / ".lm-eval-cache" / f"{model_name}-{digest}"
 
 
+def _lm_eval_interpreter(executable: str) -> str:
+    """Use the interpreter selected by the installed lm-eval launcher."""
+    try:
+        first_line = Path(executable).read_text().splitlines()[0]
+    except (OSError, IndexError):
+        return sys.executable
+    if first_line.startswith("#!"):
+        interpreter = first_line[2:].strip().split()[0]
+        if Path(interpreter).exists():
+            return interpreter
+    return sys.executable
+
+
 def _lm_eval_stderr_key(metric: str, metrics: dict) -> str | None:
     base, separator, suffix = metric.partition(",")
     candidates = [
@@ -1114,8 +1127,7 @@ def run_lm_eval(base_url: str, model: str, results_dir: Path, tasks: str,
         print(f"resuming from cached lm-eval responses: {cache_db}")
     else:
         print(f"lm-eval response checkpoint: {cache_db}")
-    command = [
-        executable,
+    harness_args = [
         "run",
         "--model", harness_model,
         # The local server accepts text prompts, not the token-ID arrays that
@@ -1127,9 +1139,28 @@ def run_lm_eval(base_url: str, model: str, results_dir: Path, tasks: str,
         "--use_cache", str(cache_path),
     ]
     if limit is not None:
-        command.extend(["--limit", str(limit)])
+        harness_args.extend(["--limit", str(limit)])
     if num_fewshot is not None:
-        command.extend(["--num_fewshot", str(num_fewshot)])
+        harness_args.extend(["--num_fewshot", str(num_fewshot)])
+
+    if backend == "completions":
+        # Import the compatibility shim before lm-eval lazily loads its model
+        # class. The installed executable may belong to a different Python
+        # environment than the interpreter running this benchmark script.
+        interpreter = _lm_eval_interpreter(executable)
+        runner = (
+            "import sys; "
+            "import lm_eval_compat; lm_eval_compat.install(); "
+            "from lm_eval.__main__ import cli_evaluate; "
+            "sys.argv = sys.argv[1:]; sys.exit(cli_evaluate())"
+        )
+        command = [interpreter, "-c", runner, executable, *harness_args]
+        environment = os.environ.copy()
+        project_dir = str(Path(__file__).parent)
+        environment["PYTHONPATH"] = project_dir + os.pathsep + environment.get("PYTHONPATH", "")
+    else:
+        command = [executable, *harness_args]
+        environment = None
 
     print(f"\n=== {model} | lm-evaluation-harness ===")
     print("command:", " ".join(command))
@@ -1137,7 +1168,7 @@ def run_lm_eval(base_url: str, model: str, results_dir: Path, tasks: str,
         command.extend(["--output_path", temp_dir])
         # Let tqdm/logging output reach the terminal while the harness runs.
         # Capturing stdout/stderr here makes a full suite appear hung for hours.
-        completed = subprocess.run(command, check=False)
+        completed = subprocess.run(command, check=False, env=environment)
         if completed.returncode:
             raise RuntimeError(
                 f"lm-eval failed with exit code {completed.returncode}; "
