@@ -4,7 +4,15 @@ from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from llm_bench import _extract_number, _lm_eval_rows, run_iq, run_lm_eval, score_task
+from llm_bench import (
+    _extract_number,
+    _lm_eval_rows,
+    begin_experiment,
+    finish_experiment,
+    run_iq,
+    run_lm_eval,
+    score_task,
+)
 
 CODE = {"kind": "code", "tests": [("add(2, 3)", repr(5)), ("add(-4, 1)", repr(-3))]}
 
@@ -92,6 +100,18 @@ def main():
           ".lm-eval-cache" in command[command.index("--use_cache") + 1] and
           command[command.index("--limit") + 1] == "20" and
           command[command.index("--num_fewshot") + 1] == "0" and wrote)
+
+    with TemporaryDirectory() as tmp, patch("llm_bench.SESSION_STATE_PATH", Path(tmp) / "sessions.json"):
+        first_id, first_resumed = begin_experiment(
+            "http://localhost:11234/v1", "test-model", "lm-eval")
+        second_id, second_resumed = begin_experiment(
+            "http://localhost:11234/v1", "test-model", "lm-eval")
+        finish_experiment("test-model", "lm-eval", second_id)
+        third_id, third_resumed = begin_experiment(
+            "http://localhost:11234/v1", "test-model", "lm-eval")
+    check("sessions: unfinished work resumes and finished work starts fresh",
+          first_id == second_id and not first_resumed and second_resumed and
+          third_id != second_id and not third_resumed)
 
     with TemporaryDirectory() as tmp, patch("llm_bench.bench", return_value={}), \
             patch("llm_bench.ask", side_effect=RuntimeError("offline")):

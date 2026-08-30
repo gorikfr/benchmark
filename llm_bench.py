@@ -8,6 +8,7 @@ Usage:
   python llm_bench.py --model a/b --iq --iq-categories math-hard,retrieval
   python llm_bench.py --model a/b --iq --iq-runs 2   # repeat suite, averages out noise
   python llm_bench.py --suite lm-eval --tasks hellaswag --model a/b
+  python llm_bench.py --suite lm-eval --tasks hellaswag --model a/b --new-session
   python llm_bench.py --model a/b --experiment-id macbook-mlx-default
   python llm_bench.py --list                  # list models served by --url
   python llm_bench.py --url http://host:port/v1 ...
@@ -49,9 +50,97 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 RESULTS_DIR = Path(__file__).parent / "results"
+SESSION_STATE_PATH = RESULTS_DIR / ".sessions.json"
 
 SHORT_PROMPT = "Write a detailed step-by-step recipe for apple pie."
 LONG_PROMPT = ("Summarize the history of computing. " * 400) + "\n\nNow count from 1 to 300."
+
+
+def _load_sessions() -> dict:
+    try:
+        state = json.loads(SESSION_STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"sessions": []}
+    return state if isinstance(state, dict) and isinstance(state.get("sessions"), list) else {"sessions": []}
+
+
+def _save_sessions(state: dict) -> None:
+    RESULTS_DIR.mkdir(exist_ok=True)
+    temporary = SESSION_STATE_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2) + "\n")
+    temporary.replace(SESSION_STATE_PATH)
+
+
+def _session_fingerprint(base_url: str, model: str, suite: str,
+                         backend: str | None = None,
+                         num_fewshot: int | None = None) -> str:
+    context = {
+        "base_url": base_url.rstrip("/"),
+        "model": model,
+        "suite": suite,
+        "backend": backend,
+        "num_fewshot": num_fewshot,
+    }
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
+
+
+def begin_experiment(base_url: str, model: str, suite: str,
+                     explicit_id: str | None = None,
+                     new_session: bool = False,
+                     backend: str | None = None,
+                     num_fewshot: int | None = None) -> tuple[str, bool]:
+    """Select or create a per-model session, returning (id, resumed)."""
+    if explicit_id and new_session:
+        raise ValueError("use either --experiment-id or --new-session, not both")
+    state = _load_sessions()
+    sessions = state["sessions"]
+    fingerprint = _session_fingerprint(base_url, model, suite, backend, num_fewshot)
+    matching = [
+        session for session in sessions
+        if session.get("model") == model
+        and session.get("suite") == suite
+        and session.get("fingerprint") == fingerprint
+        and session.get("status") == "running"
+    ]
+    resumed = bool(matching) and explicit_id is None and not new_session
+    if resumed:
+        experiment_id = max(matching, key=lambda session: session.get("updated_at", ""))["experiment_id"]
+    else:
+        if new_session:
+            for session in sessions:
+                if session.get("model") == model and session.get("suite") == suite and session.get("status") == "running":
+                    session["status"] = "superseded"
+        experiment_id = explicit_id or (
+            "auto-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+        )
+    sessions[:] = [
+        session for session in sessions
+        if not (
+            session.get("model") == model
+            and session.get("suite") == suite
+            and session.get("experiment_id") == experiment_id
+        )
+    ]
+    sessions.append({
+        "model": model,
+        "suite": suite,
+        "fingerprint": fingerprint,
+        "experiment_id": experiment_id,
+        "status": "running",
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+    _save_sessions(state)
+    return experiment_id, resumed
+
+
+def finish_experiment(model: str, suite: str, experiment_id: str) -> None:
+    state = _load_sessions()
+    for session in state["sessions"]:
+        if (session.get("model") == model and session.get("suite") == suite and
+                session.get("experiment_id") == experiment_id):
+            session["status"] = "finished"
+            session["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _save_sessions(state)
 
 
 def get(url: str, timeout: float = 10.0):
@@ -1105,8 +1194,10 @@ def main():
     ap.add_argument("--iq-tokens", type=positive_int, default=2048, help="max_tokens per IQ question (room for reasoning models)")
     ap.add_argument("--iq-categories", default="", help="comma-separated category filter, e.g. math-hard,retrieval (default: all)")
     ap.add_argument("--iq-runs", type=positive_int, default=1, help="repeat the IQ suite N times")
-    ap.add_argument("--experiment-id", default="default",
-                    help="comparable-run group; change it when hardware or server settings change")
+    ap.add_argument("--experiment-id",
+                    help="explicit comparable-run group; otherwise sessions are created or resumed automatically")
+    ap.add_argument("--new-session", action="store_true",
+                    help="start a fresh auto-generated session instead of resuming an unfinished one")
     ap.add_argument("--list", action="store_true", help="list models served by --url and exit")
     ap.add_argument("--index", action="store_true", help="rebuild results.json index for dashboard.html")
     args = ap.parse_args()
@@ -1125,30 +1216,47 @@ def main():
         ap.error("give --model (repeatable) or --list")
     if args.iq and args.suite:
         ap.error("use either --iq or --suite, not both")
+    if args.experiment_id and args.new_session:
+        ap.error("use either --experiment-id or --new-session, not both")
     suite = args.suite or ("iq" if args.iq else "speed")
     if suite == "lm-eval" and not {task.strip() for task in args.tasks.split(",") if task.strip()}:
         ap.error("--tasks must contain at least one task for --suite lm-eval")
     if suite != "iq" and args.iq_categories:
         ap.error("--iq-categories requires --iq or --suite iq")
+    if suite == "iq":
+        cats = {c.strip() for c in args.iq_categories.split(",") if c.strip()}
+        if cats:
+            known = {t["cat"] for t in IQ_TASKS}
+            unknown = sorted(cats - known)
+            if unknown:
+                ap.error(f"unknown --iq-categories {unknown}; known: {sorted(known)}")
+    if suite == "lm-eval" and shutil.which("lm-eval") is None:
+        ap.error("lm-eval is not installed; install it with: python3 -m pip install 'lm-eval[api]'")
 
     for model in args.model:
-        if suite == "iq":
-            cats = {c.strip() for c in args.iq_categories.split(",") if c.strip()} or None
-            if cats:
-                known = {t["cat"] for t in IQ_TASKS}
-                unknown = sorted(cats - known)
-                if unknown:
-                    ap.error(f"unknown --iq-categories {unknown}; known: {sorted(known)}")
-            for _ in range(args.iq_runs):
-                run_iq(args.url, model, RESULTS_DIR, args.iq_tokens, cats, args.experiment_id)
-        elif suite == "lm-eval":
-            try:
+        try:
+            experiment_id, resumed = begin_experiment(
+                args.url, model, suite, args.experiment_id, args.new_session,
+                args.lm_eval_backend if suite == "lm-eval" else None,
+                args.num_fewshot if suite == "lm-eval" else None,
+            )
+            if resumed:
+                print(f"resuming unfinished {suite} experiment for {model}: {experiment_id}")
+            else:
+                print(f"starting {suite} experiment for {model}: {experiment_id}")
+            if suite == "iq":
+                cats = {c.strip() for c in args.iq_categories.split(",") if c.strip()} or None
+                for _ in range(args.iq_runs):
+                    run_iq(args.url, model, RESULTS_DIR, args.iq_tokens, cats, experiment_id)
+            elif suite == "lm-eval":
                 run_lm_eval(args.url, model, RESULTS_DIR, args.tasks, args.limit,
-                            args.num_fewshot, args.experiment_id, args.lm_eval_backend)
-            except RuntimeError as e:
-                ap.error(str(e))
+                            args.num_fewshot, experiment_id, args.lm_eval_backend)
+            else:
+                run_model(args.url, model, args.runs, RESULTS_DIR, experiment_id)
+        except RuntimeError as e:
+            ap.error(str(e))
         else:
-            run_model(args.url, model, args.runs, RESULTS_DIR, args.experiment_id)
+            finish_experiment(model, suite, experiment_id)
     RESULTS_DIR.mkdir(exist_ok=True)
     files = sorted(p.name for p in RESULTS_DIR.glob("*.jsonl"))
     (RESULTS_DIR.parent / "results.json").write_text(json.dumps(files))
