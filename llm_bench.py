@@ -1019,13 +1019,13 @@ def run_lm_eval(base_url: str, model: str, results_dir: Path, tasks: str,
     print("command:", " ".join(command))
     with tempfile.TemporaryDirectory(prefix="lm-eval-") as temp_dir:
         command.extend(["--output_path", temp_dir])
-        completed = subprocess.run(command, text=True, capture_output=True, check=False)
-        if completed.stdout:
-            print(completed.stdout, end="")
+        # Let tqdm/logging output reach the terminal while the harness runs.
+        # Capturing stdout/stderr here makes a full suite appear hung for hours.
+        completed = subprocess.run(command, check=False)
         if completed.returncode:
-            details = completed.stderr.strip() or completed.stdout.strip()
             raise RuntimeError(
-                f"lm-eval failed with exit code {completed.returncode}: {details[-2000:]}"
+                f"lm-eval failed with exit code {completed.returncode}; "
+                "see the harness output above"
             )
         payload = _lm_eval_result_payload(Path(temp_dir))
 
