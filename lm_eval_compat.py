@@ -18,6 +18,19 @@ def response_has_logprobs(response) -> bool:
     return True
 
 
+def response_summary(response) -> str:
+    outputs = response if isinstance(response, list) else [response]
+    parts = []
+    for output in outputs:
+        choices = output.get("choices", []) if isinstance(output, dict) else []
+        for choice in choices:
+            parts.append(
+                f"finish_reason={choice.get('finish_reason')!r}, "
+                f"text={choice.get('text')!r}, logprobs={choice.get('logprobs')!r}"
+            )
+    return "; ".join(parts) or repr(response)
+
+
 def install() -> None:
     """Retry intermittent null-logprobs responses before harness parsing."""
     from lm_eval.models.openai_completions import LocalCompletionsAPI
@@ -33,13 +46,14 @@ def install() -> None:
                 return response
             if attempt < 2:
                 print(
-                    "lm-eval received a response without logprobs; "
+                    "lm-eval received a response without usable logprobs "
+                    f"({response_summary(response)}); "
                     f"retrying ({attempt + 1}/2)",
                     flush=True,
                 )
                 time.sleep(0.5)
         raise RuntimeError(
-            "local-completions returned logprobs=null after 3 attempts; "
+            "local-completions returned unusable logprobs after 3 attempts; "
             "the server cannot score this request reliably"
         )
 

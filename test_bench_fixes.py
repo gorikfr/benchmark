@@ -13,7 +13,7 @@ from llm_bench import (
     run_lm_eval,
     score_task,
 )
-from lm_eval_compat import response_has_logprobs
+from lm_eval_compat import response_has_logprobs, response_summary
 
 CODE = {"kind": "code", "tests": [("add(2, 3)", repr(5)), ("add(-4, 1)", repr(-3))]}
 
@@ -87,6 +87,10 @@ def main():
     check("lm-eval: null logprobs are detectable",
           response_has_logprobs({"choices": [{"logprobs": {"token_logprobs": []}}]}) and
           not response_has_logprobs({"choices": [{"logprobs": None}]}))
+    check("lm-eval: malformed response summary is readable",
+          "finish_reason='length'" in response_summary(
+              {"choices": [{"finish_reason": "length", "text": "x", "logprobs": None}]}
+          ))
 
     with TemporaryDirectory() as tmp, patch("llm_bench.shutil.which", return_value="/bin/lm-eval"), \
             patch("llm_bench.subprocess.run", return_value=CompletedProcess([], 0, "done\n", "")) as run, \
