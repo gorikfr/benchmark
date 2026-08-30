@@ -1,0 +1,318 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>LLM Bench</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; color: #ddd; }
+  h1 { font-size: 1.4rem; }
+  .hint { color: #888; font-size: .85rem; margin-bottom: 1.5rem; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
+  th, td { text-align: right; padding: .4rem .7rem; border-bottom: 1px solid #333; }
+  th { color: #999; font-weight: 500; border-bottom: 2px solid #444; }
+  td:first-child, th:first-child { text-align: left; }
+  tr:hover td { background: #1f2430; }
+  .best { color: #7fd07f; font-weight: 600; }
+  .bad { color: #777; }
+  code { background: #222; padding: .1rem .35rem; border-radius: 4px; }
+  .bar { display: inline-block; height: 8px; background: #4a90d9; border-radius: 2px; vertical-align: middle; margin-left: .5rem; }
+</style>
+</head>
+<body>
+<h1>LLM Bench</h1>
+<p class="hint">Loads <code>results/*.jsonl</code> — run <code>python llm_bench.py --model &lt;id&gt;</code>
+(add <code>--iq</code> for intelligence scores) then refresh this page.
+Best value per column highlighted. Only the latest benchmark run per model is shown (earlier runs listed below).
+Token rates are shown only when the server reports authoritative usage.</p>
+<div id="content">No results/ directory or files found. (Open this file from the repo root via a local server, e.g. <code>python -m http.server</code>.)</div>
+
+<script>
+const LABELS = {
+  gen: "gen (short, 512 tok)",
+  "long-prompt": "long prompt (~2.8k tok)",
+};
+
+async function loadResults() {
+  let files;
+  try {
+    const response = await fetch("results.json");
+    if (!response.ok) throw new Error(`results.json: HTTP ${response.status}`);
+    files = await response.json();
+    if (!Array.isArray(files)) throw new Error("results.json must contain an array");
+  }
+  catch { return null; }
+  const runs = [];
+  for (const f of files) {
+    try {
+      const text = await (await fetch("results/" + f)).text();
+      for (const line of text.trim().split("\n"))
+        if (line) runs.push(JSON.parse(line));
+    } catch (e) { console.warn("skip", f, e); }
+  }
+  return runs;
+}
+
+function fmt(v, d = 2) { return v == null ? "—" : Number(v).toFixed(d); }
+
+// Combined score: IQ contributes 50%, and the available speed metrics share the
+// other 50%. Missing speed metrics are omitted from the speed sub-score, but a
+// model must have both IQ and at least one speed metric to be ranked.
+function combinedScore(iqAcc, speed, peers) {
+  if (iqAcc == null) return null;
+  const speedParts = [];
+  const add = (k, higher) => {
+    const v = speed[k];
+    if (v == null) return;
+    const vals = peers.map(p => p[k]).filter(x => x != null);
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    if (hi <= lo) { speedParts.push(1); return; } // all tied -> no basis to rank
+    speedParts.push((higher ? v - lo : hi - v) / (hi - lo));
+  };
+  add("gen_tps", true);
+  add("ttft_s", false);
+  add("long_gen_tps", true);
+  if (!speedParts.length) return null;
+  const speedScore = speedParts.reduce((a, b) => a + b, 0) / speedParts.length;
+  return (iqAcc + speedScore) / 2;
+}
+
+function latestRunRows(rs) {
+  const identified = rs.filter(r => r.run_id);
+  if (identified.length) {
+    const latestId = identified[identified.length - 1].run_id;
+    return identified.filter(r => r.run_id === latestId);
+  }
+  // Compatibility with result files written before explicit run IDs existed.
+  return rs.slice(-3);
+}
+
+function latestIqRows(rs) {
+  const identified = rs.filter(r => r.run_id);
+  if (identified.length) {
+    const latestId = identified[identified.length - 1].run_id;
+    return identified.filter(r => r.run_id === latestId);
+  }
+  const timestamps = rs.map(r => Date.parse(r.ts)).filter(Number.isFinite);
+  if (!timestamps.length) return [];
+  const latestTs = Math.max(...timestamps);
+  return rs.filter(r => Date.parse(r.ts) === latestTs);
+}
+
+function iqSection(iqRuns) {
+  if (!iqRuns.length) return null;
+  const byModel = {};
+  for (const r of iqRuns) (byModel[r.model] ||= []).push(r);
+  const latest = [];
+  for (const [, rs] of Object.entries(byModel)) latest.push(latestIqRows(rs));
+  const cats = [...new Set(iqRuns.filter(r => r.label === "iq").map(r => r.category))].sort();
+  const rows = [];
+  for (const rs of latest) {
+    const tot = [...rs].reverse().find(r => r.label === "iq-total");
+    if (!tot) continue;
+    const byCat = {};
+    for (const r of rs) if (r.label === "iq") byCat[r.category] = r;
+    const cell = r => !r || r.accuracy == null ? "—"
+      : `<span title="${r.correct}/${r.total}">${Math.round(r.accuracy * 100)}%</span>`;
+    rows.push({ model: tot.model, tot, cells: cats.map(c => cell(byCat[c])) });
+  }
+  if (!rows.length) return null;
+  rows.sort((a, b) => (b.tot.accuracy ?? -1) - (a.tot.accuracy ?? -1));
+  let html = "<tr><th>model</th>" + cats.map(c => `<th>${c}</th>`).join("") + "<th>TOTAL</th></tr>";
+  for (const { model, tot, cells } of rows) {
+    html += `<tr><td>${model}</td>${cells.map(c => `<td>${c}</td>`).join("")}` +
+      `<td><b>${tot.accuracy == null ? "—" : Math.round(tot.accuracy * 100) + "%"}</b>` +
+      `<span class="bar" style="width:${tot.accuracy == null ? 0 : Math.round(tot.accuracy * 100)}px" ` +
+      `title="${tot.correct}/${tot.total} evaluated; ${tot.failed ?? 0} request failures"></span></td></tr>`;
+  }
+  const tbl = document.createElement("table");
+  tbl.innerHTML = html;
+  for (let ci = 1; ci <= cats.length + 1; ci++) {
+    let best = null, bestCell = null;
+    for (const tr of tbl.querySelectorAll("tr")) {
+      if (tr.querySelector("th")) continue;
+      const v = parseFloat(tr.children[ci].textContent);
+      if (isNaN(v)) continue;
+      if (best == null || v > best) { best = v; bestCell = tr.children[ci]; }
+    }
+    if (bestCell) bestCell.classList.add("best");
+  }
+  const frag = document.createDocumentFragment();
+  frag.append(h1("Intelligence (--iq, latest run)"), tbl);
+  return frag;
+}
+
+function render(runs) {
+  const speed = runs.filter(r => r.label !== "iq" && r.label !== "iq-total");
+  const iqRuns = runs.filter(r => r.label === "iq" || r.label === "iq-total");
+  const byModel = {};
+  for (const r of speed) (byModel[r.model] ||= []).push(r);
+
+  const models = Object.keys(byModel).sort();
+  const rounds = {}; // model -> all non-warmup rows, grouped below by run_id
+  for (const m of models) {
+    const rs = byModel[m].filter(r => r.label !== "warmup");
+    rounds[m] = rs;
+  }
+
+  const metrics = [
+    ["gen_tps", "gen tok/s", true],
+    ["prefill_tps", "prefill tok/s", true],
+    ["ttft_s", "TTFT (s)", false],
+    ["total_s", "total (s)", false],
+  ];
+
+  function avgOf(rs, k) {
+    const v = rs.map(r => r[k]).filter(x => x != null);
+    return v.length ? v.reduce((a, b) => a + b) / v.length : null;
+  }
+
+  // latest benchmark run per model, split by label
+  const speedRows = Object.fromEntries(models.map(m => [
+    m, { gen: latestRunRows(rounds[m]).filter(r => r.label === "gen"),
+         long: latestRunRows(rounds[m]).filter(r => r.label === "long-prompt") }]));
+
+  function table(getRows) {
+    // getRows(model) -> array of run objects for that model; one table per label
+    // so short-prompt gens and the long-prompt run are never averaged together
+    const labels = ["gen", "long-prompt"];
+    const cellByModel = {}; // label -> model -> [cell per metric]
+    const tables = labels.map(label => {
+      cellByModel[label] = {};
+      const html = [];
+      html.push(`<table><tr><th>model</th><th>label</th>` +
+        metrics.map(([, h]) => `<th>${h}</th>`).join("") + "</tr>");
+      for (const m of models) {
+        const rs = getRows(m).filter(r => r.label === label);
+        if (!rs.length) continue;
+        html.push(`<tr><td>${m}</td><td>${LABELS[label] || label}</td>` +
+          metrics.map(([k]) => `<td>${fmt(avgOf(rs, k))}</td>`).join("") + "</tr>");
+      }
+      if (html.length < 2) return null;
+      const tbl = document.createElement("div");
+      tbl.innerHTML = html.join("");
+      const t = tbl.firstChild;
+      for (const tr of t.querySelectorAll("tr")) {
+        if (tr.querySelector("th")) continue;
+        cellByModel[label][tr.children[0].textContent] =
+          [...tr.children].slice(2);
+      }
+      metrics.forEach(([k, , higher], ci) => {
+        // rank from the averaged values, not from parseFloat(cell text):
+        // fmt() renders a missing value as an em dash, which parseFloat reads as 0
+        const vals = [];
+        for (const m of models) {
+          const rs = getRows(m).filter(r => r.label === label);
+          const v = rs.length ? avgOf(rs, k) : null;
+          if (v != null) vals.push({ v, m });
+        }
+        if (!vals.length) return;
+        vals.sort((a, b) => higher ? b.v - a.v : a.v - b.v);
+        const cell = cellByModel[label]?.[vals[0].m]?.[ci];
+        if (cell) cell.classList.add("best");
+      });
+      return t;
+    });
+    return { labels, tables };
+  }
+
+  function iqByModel() {
+    const byModel = {};
+    for (const r of iqRuns) (byModel[r.model] ||= []).push(r);
+    return byModel;
+  }
+
+  function combinedTable() {
+    // latest IQ total per model + latest speed benchmark run per model
+    const iqTotals = {};
+    for (const [m, rs] of Object.entries(iqByModel())) {
+      const cur = latestIqRows(rs);
+      const tot = [...cur].reverse().find(r => r.label === "iq-total");
+      if (tot) iqTotals[m] = tot;
+    }
+    const stats = {};
+    for (const m of new Set([...Object.keys(iqTotals), ...models])) {
+      const gen = speedRows[m]?.gen || [];
+      const long = speedRows[m]?.long || [];
+      stats[m] = {
+        iq: iqTotals[m]?.accuracy ?? null,
+        gen_tps: avgOf(gen, "gen_tps"),
+        ttft_s: avgOf(gen, "ttft_s"),
+        long_gen_tps: avgOf(long, "gen_tps"),
+        tasks: iqTotals[m]?.total ?? null,
+      };
+    }
+    const peers = Object.values(stats);
+    const sc = s => combinedScore(s.iq, s, peers);
+    const rows = Object.entries(stats).sort((a, b) => (sc(b[1]) ?? -1) - (sc(a[1]) ?? -1));
+    if (!rows.some(([, s]) => sc(s) != null)) {
+      const p = document.createElement("p");
+      p.className = "hint";
+      p.textContent = "Need at least one speed run and one --iq run for a model to enter the combined ranking.";
+      return p;
+    }
+    const head = ["model", "score", "iq", "gen tok/s", "TTFT (s)", "long gen tok/s"];
+    let html = "<tr>" + head.map(h => `<th>${h}</th>`).join("") + "</tr>";
+    for (const [m, s] of rows) {
+      const v = sc(s);
+      html += `<tr><td>${m}</td>` +
+      `<td>${v == null ? "—" : `<b>${(v * 100).toFixed(1)}</b>`}` +
+        `<span class="bar" data-score="${v ?? ""}" style="width:${v == null ? 0 : Math.round(v * 100)}px"></span></td>` +
+        `<td title="${s.tasks ?? 0} tasks">${s.iq == null ? "—" : (s.iq * 100).toFixed(0) + "%"}</td>` +
+        `<td>${fmt(s.gen_tps, 1)}</td><td>${fmt(s.ttft_s)}</td><td>${fmt(s.long_gen_tps, 1)}</td></tr>`;
+    }
+    const t = document.createElement("table");
+    t.innerHTML = html;
+    const ds = rows.map(([, s]) => sc(s)).filter(v => v != null);
+    if (ds.length) {
+      const best = Math.max(...ds);
+      for (const tr of t.querySelectorAll("tr")) {
+        if (tr.querySelector("th")) continue;
+        const cell = tr.children[1];
+        if (Number(cell.querySelector(".bar")?.dataset.score) === best) cell.classList.add("best");
+      }
+    }
+    return t;
+  }
+
+  const content = document.getElementById("content");
+  content.innerHTML = "";
+
+  const iq = iqSection(iqRuns);
+  if (iq) content.append(iq);
+
+  content.append(h1("Combined ranking (intelligence + speed, equal weight)"));
+  content.append(combinedTable());
+
+  content.append(h1("Latest benchmark run (averaged per label)"));
+  const round = table(m => [...speedRows[m].gen, ...speedRows[m].long]);
+  round.tables.forEach((t, i) => {
+    if (!t) {
+      const p = document.createElement("p");
+      p.className = "hint";
+      p.textContent = `No ${round.labels[i]} runs in the latest round.`;
+      content.append(p);
+      return;
+    }
+    content.append(t);
+  });
+
+  content.append(h1("All runs"));
+  const all = document.createElement("table");
+  all.innerHTML = "<tr><th>model</th><th>when</th><th>label</th><th>tokens</th><th>TTFT (s)</th><th>gen tok/s</th><th>prefill tok/s</th><th>total (s)</th></tr>" +
+    speed.map(r => `<tr><td>${r.model}</td><td>${(r.ts || "").slice(11, 19)}</td><td>${r.label}</td>
+      <td>${r.tokens}</td><td>${fmt(r.ttft_s)}</td><td>${fmt(r.gen_tps, 1)}</td>
+      <td>${fmt(r.prefill_tps, 1)}</td><td>${fmt(r.total_s)}</td></tr>`).join("");
+  content.append(all);
+}
+
+function h1(t) { const el = document.createElement("h1"); el.textContent = t; el.style.fontSize = "1.1rem"; return el; }
+
+loadResults().then(runs => {
+  if (runs) render(runs);
+  else document.getElementById("content").textContent =
+    "No results.json found. Run: python llm_bench.py --model <id>  (then refresh).";
+});
+</script>
+</body>
+</html>
