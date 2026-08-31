@@ -35,6 +35,13 @@ The optional `lm-evaluation-harness` integration has its own dependency. Install
 python3 -m pip install -r requirements-lm-eval.txt
 ```
 
+Inspect AI is another optional integration for running maintained evaluation
+tasks and agent-style evaluations against the same local server:
+
+```bash
+python3 -m pip install -r requirements-inspect-ai.txt
+```
+
 The default server URL is `http://localhost:11234/v1`. Start your preferred local inference server separately and make sure it supports streaming chat completions. For accurate token-based speed metrics, the server should return streaming `usage` data when requested; otherwise token counts and token rates are shown as unavailable rather than estimated.
 
 ## Quick start
@@ -120,6 +127,44 @@ Start with `--limit 10` or `--limit 20` to verify the endpoint and tokenizer bef
 Response checkpointing is enabled automatically. Completed lm-eval requests are stored in an ignored SQLite cache under `results/.lm-eval-cache/`; rerunning the same model, URL, task list, backend, few-shot setting, and automatically selected session resumes from those responses after a crash or interruption. Change the experiment ID when the model or server configuration changes, which prevents incompatible cached responses from being reused. The final aggregate result is written only after the suite completes, but the request-level cache survives an interrupted run. The integration also retries transient local-server responses that omit log-probabilities; persistent `logprobs=null` responses are reported as an error rather than scored as a guessed answer.
 
 The integration uses the harness `local-completions` backend by default and maps `--url http://host:port/v1` to `/v1/completions`. It sends decoded text prompts because many local servers reject token-ID arrays; lm-eval still uses the model tokenizer locally to align log-likelihoods. This is important for tasks such as `hellaswag`, which require token log-likelihoods; the chat backend cannot provide those. For generation-only tasks and servers that expose only chat completions, use `--lm-eval-backend chat`, which maps to `/v1/chat/completions`. The harness writes task metrics into the same ignored per-model JSONL files. The dashboard shows the latest lm-eval results in a separate table; they are not mixed into the built-in IQ score or the combined speed/IQ ranking because they use different task definitions and scoring rules. Use the same task list, few-shot count, limit, server settings, backend, and experiment ID when comparing models.
+
+## Optional standard benchmarks: Inspect AI
+
+[Inspect AI](https://inspect.aisi.org.uk/) provides a task framework, model
+API adapters, scorers, transcripts, and resumable evaluation logs. The
+wrapper connects its `openai-api` provider to the server's
+`/v1/chat/completions` endpoint and stores the `.eval` logs under the ignored
+`results/.inspect-logs/` directory. Completed scores are copied into the
+per-model JSONL file so the dashboard can display them without embedding the
+large Inspect transcripts in Git.
+
+Install both Inspect AI and the standard task collection, then start with a
+small sample:
+
+```bash
+python3 -m pip install -r requirements-inspect-ai.txt
+python3 llm_bench.py \
+  --suite inspect \
+  --tasks inspect_evals/simpleqa \
+  --limit 20 \
+  --model your-model-id
+```
+
+With no `--tasks`, the Inspect suite defaults to
+`inspect_evals/simpleqa`. You can pass several task references separated by
+commas, for example `inspect_evals/simpleqa,inspect_evals/gsm8k`. Inspect
+supports packaged tasks and local task files; see its documentation for the
+task-specific requirements and scoring semantics. The wrapper limits local
+concurrency, disables adaptive connection scaling, retries failed model calls,
+and flushes log samples frequently so interruptions retain as much work as
+possible. If a previous Inspect log is unfinished, rerunning the same command
+automatically uses Inspect's `eval-retry` flow and preserves completed samples.
+
+Inspect task scores are shown in a separate dashboard table. They are not
+combined with the built-in IQ score because Inspect tasks, scorers, and metric
+definitions vary by evaluation. A successful run must have complete samples;
+partial or failed logs remain available for retry but are not written as a
+misleading final score.
 
 The numeric options are positive where a count must be nonzero; `--num-fewshot` may be zero. The speed benchmark uses two short-prompt samples for each `--runs` iteration and one long-prompt sample per invocation.
 

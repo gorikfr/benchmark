@@ -1,0 +1,4 @@
+# Inspect AI plus its maintained standard evaluation task collection.
+inspect-ai>=0.3.206
+inspect-evals
+openai

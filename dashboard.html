@@ -191,10 +191,10 @@ function iqSection(iqRuns) {
   return frag;
 }
 
-function lmEvalSection(lmRuns) {
-  if (!lmRuns.length) return null;
+function standardEvalSection(evalRuns, title) {
+  if (!evalRuns.length) return null;
   const byModel = {};
-  for (const r of lmRuns) (byModel[r.model] ||= []).push(r);
+  for (const r of evalRuns) (byModel[r.model] ||= []).push(r);
   const rows = [];
   for (const rs of Object.values(byModel)) {
     rows.push(...latestRunRows(rs));
@@ -206,7 +206,7 @@ function lmEvalSection(lmRuns) {
     rows.map(r => `<tr><td>${r.model}</td><td>${r.task}</td><td>${r.metric}</td>` +
       `<td>${fmt(r.value, 4)}</td><td>${fmt(r.stderr, 4)}</td></tr>`).join("");
   const frag = document.createDocumentFragment();
-  frag.append(h1("lm-evaluation-harness (latest run)"), table);
+  frag.append(h1(`${title} (latest run)`), table);
   return frag;
 }
 
@@ -216,7 +216,9 @@ function render(runs, selectedExperiment = null) {
     ? selectedExperiment : latestExperimentId(runs);
   const viewRuns = runs.filter(r => experimentId(r) === activeExperiment);
   const lmRuns = viewRuns.filter(r => r.label === "lm-eval");
-  const speed = viewRuns.filter(r => r.label !== "iq" && r.label !== "iq-total" && r.label !== "lm-eval");
+  const inspectRuns = viewRuns.filter(r => r.label === "inspect-ai");
+  const speed = viewRuns.filter(r => r.label !== "iq" && r.label !== "iq-total" &&
+    r.label !== "lm-eval" && r.label !== "inspect-ai");
   const iqRuns = viewRuns.filter(r => r.label === "iq" || r.label === "iq-total");
   const byModel = {};
   for (const r of speed) (byModel[r.model] ||= []).push(r);
@@ -421,8 +423,10 @@ function render(runs, selectedExperiment = null) {
 
   const iq = iqSection(iqRuns);
   if (iq) content.append(iq);
-  const lmEval = lmEvalSection(lmRuns);
+  const lmEval = standardEvalSection(lmRuns, "lm-evaluation-harness");
   if (lmEval) content.append(lmEval);
+  const inspect = standardEvalSection(inspectRuns, "Inspect AI");
+  if (inspect) content.append(inspect);
 
   content.append(h1("Combined ranking (average of comparable runs; intelligence + speed, equal weight)"));
   content.append(combinedTable());

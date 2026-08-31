@@ -6,10 +6,12 @@ from unittest.mock import patch
 
 from llm_bench import (
     _extract_number,
+    _inspect_rows,
     _lm_eval_rows,
     begin_experiment,
     finish_experiment,
     run_iq,
+    run_inspect,
     run_lm_eval,
     score_task,
 )
@@ -91,6 +93,71 @@ def main():
           "finish_reason='length'" in response_summary(
               {"choices": [{"finish_reason": "length", "text": "x", "logprobs": None}]}
           ))
+
+    inspect_records = [{
+        "path": "/tmp/simpleqa.eval",
+        "status": "success",
+        "task": "inspect_evals/simpleqa",
+        "model": "openai-api/local/test-model",
+        "total_samples": 20,
+        "completed_samples": 20,
+        "scores": [{
+            "name": "accuracy",
+            "scorer": "model_graded_fact",
+        "metrics": {"accuracy": {"value": 0.75}, "stderr": {"value": 0.05}},
+        }],
+    }, {
+        "path": "/tmp/incomplete.eval",
+        "status": "error",
+        "task": "inspect_evals/simpleqa",
+        "total_samples": 20,
+        "completed_samples": 3,
+        "scores": [],
+    }]
+    retry_success = dict(inspect_records[0])
+    retry_success["scores"] = [{
+        "name": "accuracy",
+        "scorer": "model_graded_fact",
+        "metrics": {"accuracy": {"value": 0.8}, "stderr": {"value": 0.04}},
+    }]
+    inspect_rows = _inspect_rows(
+        [inspect_records[0], retry_success, inspect_records[1]],
+        "test-model", "run-2", "exp-2", "now"
+    )
+    check("Inspect AI: complete scores are normalized",
+          len(inspect_rows) == 1 and inspect_rows[0]["value"] == 0.8 and
+          inspect_rows[0]["suite"] == "inspect-ai" and
+          inspect_rows[0]["metric"] == "model_graded_fact.accuracy" and
+          inspect_rows[0]["stderr"] == 0.04 and
+          inspect_rows[0]["completed_samples"] == 20)
+
+    inspect_success = dict(inspect_records[0])
+    with TemporaryDirectory() as tmp, patch("llm_bench.shutil.which", return_value="/bin/inspect"), \
+            patch("llm_bench._inspect_log_records", side_effect=[[], [inspect_success]]), \
+            patch("llm_bench.subprocess.run", return_value=CompletedProcess([], 0)) as run:
+        rows = run_inspect("http://localhost:11234/v1", "test-model", Path(tmp),
+                           "inspect_evals/simpleqa", limit=20, experiment_id="exp-2")
+        command = run.call_args.args[0]
+        output = Path(tmp) / "test-model.jsonl"
+        wrote = output.exists()
+    check("Inspect AI: uses local chat provider and durable logs",
+          len(rows) == 1 and command[:5] == [
+              "/bin/inspect", "eval", "inspect_evals/simpleqa", "--model",
+              "openai-api/local/test-model",
+          ] and "--model-base-url" in command and
+          command[command.index("--limit") + 1] == "20" and
+          "--log-dir" in command and wrote)
+
+    with TemporaryDirectory() as tmp, patch("llm_bench.shutil.which", return_value="/bin/inspect"), \
+            patch("llm_bench._inspect_log_records", side_effect=[
+                [{"path": "/tmp/failed.eval", "status": "error"}], [inspect_success]
+            ]), patch("llm_bench.subprocess.run", return_value=CompletedProcess([], 0)) as run:
+        run_inspect("http://localhost:11234/v1", "test-model", Path(tmp),
+                    "inspect_evals/simpleqa", experiment_id="exp-2")
+        command = run.call_args.args[0]
+    check("Inspect AI: retries unfinished logs",
+          command[:3] == ["/bin/inspect", "eval-retry", "/tmp/failed.eval"] and
+          "--limit" not in command)
 
     with TemporaryDirectory() as tmp, patch("llm_bench.shutil.which", return_value="/bin/lm-eval"), \
             patch("llm_bench.subprocess.run", return_value=CompletedProcess([], 0, "done\n", "")) as run, \

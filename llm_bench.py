@@ -8,6 +8,7 @@ Usage:
   python llm_bench.py --model a/b --iq --iq-categories math-hard,retrieval
   python llm_bench.py --model a/b --iq --iq-runs 2   # repeat suite, averages out noise
   python llm_bench.py --suite lm-eval --tasks hellaswag --model a/b
+  python llm_bench.py --suite inspect --tasks inspect_evals/simpleqa --model a/b
   python llm_bench.py --suite lm-eval --tasks hellaswag --model a/b --new-session
   python llm_bench.py --model a/b --experiment-id macbook-mlx-default
   python llm_bench.py --list                  # list models served by --url
@@ -21,8 +22,9 @@ The IQ suite has two generations of tasks:
 
 Verify all answers before benchmarking:  python verify_iq.py
 
-The optional lm-evaluation-harness suite requires its separate installation;
-see README.md. It runs standard tasks through the local server's completion API.
+The optional lm-evaluation-harness and Inspect AI suites require separate
+installations; see README.md. They run standard tasks through the local
+server's OpenAI-compatible API.
 
 Results are appended to results/<model>.jsonl (one JSON line per measurement or
 task metric) so you
@@ -1048,6 +1050,201 @@ def _lm_eval_interpreter(executable: str) -> str:
     return sys.executable
 
 
+def _inspect_log_dir(results_dir: Path, base_url: str, model: str,
+                     tasks: str, experiment_id: str) -> Path:
+    """Return a stable, ignored Inspect log directory for one evaluation."""
+    context = json.dumps({
+        "base_url": base_url.rstrip("/"),
+        "model": model,
+        "tasks": tasks,
+        "experiment_id": experiment_id,
+    }, sort_keys=True).encode()
+    digest = hashlib.sha256(context).hexdigest()[:16]
+    model_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", model).strip("._") or "model"
+    return results_dir / ".inspect-logs" / f"{model_name}-{digest}"
+
+
+def _inspect_interpreter(executable: str) -> str:
+    """Use the interpreter selected by the installed Inspect launcher."""
+    return _lm_eval_interpreter(executable)
+
+
+def _inspect_log_records(log_dir: Path, interpreter: str) -> list[dict]:
+    """Read Inspect log headers without importing Inspect in this process."""
+    parser = """
+import json
+import sys
+from inspect_ai.log import read_eval_log
+
+log = read_eval_log(sys.argv[1], header_only=True)
+result = log.results
+scores = []
+for score in (result.scores if result else []):
+    metrics = {}
+    for name, metric in (score.metrics or {}).items():
+        metrics[name] = {"value": metric.value}
+    scores.append({"name": score.name, "scorer": score.scorer, "metrics": metrics})
+print(json.dumps({
+    "path": sys.argv[1],
+    "status": log.status,
+    "task": log.eval.task,
+    "model": log.eval.model,
+    "total_samples": result.total_samples if result else None,
+    "completed_samples": result.completed_samples if result else None,
+    "scores": scores,
+}))
+"""
+    records = []
+    for path in sorted(log_dir.rglob("*.eval"), key=lambda item: item.stat().st_mtime_ns):
+        parsed = subprocess.run(
+            [interpreter, "-c", parser, str(path)],
+            check=False, capture_output=True, text=True,
+        )
+        if parsed.returncode:
+            continue
+        try:
+            record = json.loads(parsed.stdout)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _inspect_rows(records: list[dict], model: str, run_id: str,
+                  experiment_id: str, ts: str) -> list[dict]:
+    """Normalize successful Inspect scores into dashboard-friendly rows."""
+    rows = []
+    # A retry writes a new log rather than overwriting the failed one. Keep
+    # only the newest complete log for each task so dashboard rows are not
+    # duplicated after a successful retry.
+    latest_complete = {}
+    for record in records:
+        if record.get("status") != "success":
+            continue
+        total = record.get("total_samples")
+        completed = record.get("completed_samples")
+        if not isinstance(total, int) or not isinstance(completed, int) or completed != total:
+            continue
+        latest_complete[record.get("task") or "unknown"] = record
+    for record in latest_complete.values():
+        task = record.get("task") or "unknown"
+        for score in record.get("scores", []):
+            if not isinstance(score, dict):
+                continue
+            scorer = score.get("scorer") or score.get("name") or "score"
+            metrics = score.get("metrics") or {}
+            stderr_payload = metrics.get("stderr")
+            stderr = stderr_payload.get("value") if isinstance(stderr_payload, dict) else stderr_payload
+            if isinstance(stderr, bool) or not isinstance(stderr, (int, float)):
+                stderr = None
+            for metric, payload in metrics.items():
+                if metric == "stderr":
+                    continue
+                value = payload.get("value") if isinstance(payload, dict) else payload
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                if not math.isfinite(float(value)):
+                    continue
+                rows.append({
+                    "model": model,
+                    "label": "inspect-ai",
+                    "suite": "inspect-ai",
+                    "task": task,
+                    "metric": f"{scorer}.{metric}",
+                    "value": value,
+                    "stderr": stderr,
+                    "higher_is_better": None,
+                    "total_samples": total,
+                    "completed_samples": completed,
+                    "ts": ts,
+                    "run_id": run_id,
+                    "experiment_id": experiment_id,
+                })
+    if not rows:
+        raise RuntimeError("Inspect AI produced no complete numeric task metrics")
+    return rows
+
+
+def run_inspect(base_url: str, model: str, results_dir: Path, tasks: str,
+                limit: int | None = None, experiment_id: str = "default") -> list[dict]:
+    """Run Inspect AI tasks against the local OpenAI-compatible chat endpoint."""
+    executable = shutil.which("inspect")
+    if executable is None:
+        raise RuntimeError(
+            "Inspect AI is not installed; install it with: "
+            "python3 -m pip install -r requirements-inspect-ai.txt"
+        )
+
+    tasks = ",".join(task.strip() for task in tasks.split(",") if task.strip())
+    task_args = [task for task in tasks.split(",") if task]
+    if not task_args:
+        raise ValueError("Inspect AI requires at least one task")
+    log_dir = _inspect_log_dir(results_dir, base_url, model, tasks, experiment_id)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    interpreter = _inspect_interpreter(executable)
+    existing = _inspect_log_records(log_dir, interpreter)
+    latest_by_task = {}
+    for record in existing:
+        latest_by_task[record.get("task") or record.get("path")] = record
+    retry_logs = [
+        record["path"] for record in existing
+        if latest_by_task.get(record.get("task") or record.get("path")) is record
+        and record.get("status") in {"started", "error", "cancelled"}
+        and record.get("path")
+    ]
+    if retry_logs:
+        command = [executable, "eval-retry", *retry_logs]
+        print(f"resuming {len(retry_logs)} unfinished Inspect AI log(s) from {log_dir}")
+    else:
+        # Ordinary Inspect Evals are chat-oriented, so use the OpenAI-compatible
+        # chat provider rather than the raw-text completions provider.
+        inspect_model = f"openai-api/local/{model}"
+        command = [
+            executable, "eval", *task_args,
+            "--model", inspect_model,
+            "--model-base-url", base_url.rstrip("/"),
+        ]
+        print(f"Inspect AI logs: {log_dir}")
+    command.extend([
+        "--log-dir", str(log_dir),
+        "--log-format", "eval",
+        "--display", "plain",
+        "--max-connections", "4",
+        "--adaptive-connections", "false",
+        "--max-retries", "3",
+        "--retry-on-error", "3",
+        "--log-buffer", "1",
+    ])
+    if limit is not None and not retry_logs:
+        command.extend(["--limit", str(limit)])
+
+    environment = os.environ.copy()
+    # The local provider still uses the OpenAI client, which expects a key even
+    # when the local server intentionally ignores authentication.
+    environment.setdefault("LOCAL_API_KEY", "local")
+    print(f"\n=== {model} | Inspect AI ===")
+    print("command:", " ".join(command))
+    completed = subprocess.run(command, check=False, env=environment)
+    records = _inspect_log_records(log_dir, interpreter)
+    if completed.returncode:
+        raise RuntimeError(
+            f"Inspect AI failed with exit code {completed.returncode}; "
+            f"logs retained in {log_dir}"
+        )
+
+    run_id = uuid.uuid4().hex
+    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    rows = _inspect_rows(records, model, run_id, experiment_id, ts)
+    results_dir.mkdir(exist_ok=True)
+    out = results_dir / (model.replace("/", "__") + ".jsonl")
+    with out.open("a") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    print(f"saved {len(rows)} Inspect AI metric rows -> {out}")
+    return rows
+
+
 def _lm_eval_stderr_key(metric: str, metrics: dict) -> str | None:
     base, separator, suffix = metric.partition(",")
     candidates = [
@@ -1212,14 +1409,14 @@ def main():
     ap.add_argument("--url", default="http://localhost:11234/v1", help="OpenAI-compatible base URL")
     ap.add_argument("--runs", type=positive_int, default=1, help="repeat short-prompt round (default 1)")
     ap.add_argument("--iq", action="store_true", help="run the intelligence suite (accuracy) instead of speed tests")
-    ap.add_argument("--suite", choices=("speed", "iq", "lm-eval"),
+    ap.add_argument("--suite", choices=("speed", "iq", "lm-eval", "inspect"),
                     help="benchmark suite; --iq is retained as a shortcut for --suite iq")
-    ap.add_argument("--tasks", default="hellaswag",
-                    help="comma-separated lm-evaluation-harness tasks (default: hellaswag)")
+    ap.add_argument("--tasks",
+                    help="comma-separated lm-eval or Inspect AI tasks (defaults: hellaswag or inspect_evals/simpleqa)")
     ap.add_argument("--limit", type=positive_int,
-                    help="limit lm-evaluation-harness examples per task")
+                    help="limit examples per task for lm-eval or Inspect AI")
     ap.add_argument("--num-fewshot", type=nonnegative_int,
-                    help="number of few-shot examples for lm-evaluation-harness")
+                    help="number of few-shot examples for lm-eval")
     ap.add_argument("--lm-eval-backend", choices=("completions", "chat"), default="completions",
                     help="lm-eval API backend (default: completions; chat cannot run log-likelihood tasks)")
     ap.add_argument("--iq-tokens", type=positive_int, default=2048, help="max_tokens per IQ question (room for reasoning models)")
@@ -1250,8 +1447,14 @@ def main():
     if args.experiment_id and args.new_session:
         ap.error("use either --experiment-id or --new-session, not both")
     suite = args.suite or ("iq" if args.iq else "speed")
-    if suite == "lm-eval" and not {task.strip() for task in args.tasks.split(",") if task.strip()}:
-        ap.error("--tasks must contain at least one task for --suite lm-eval")
+    tasks = args.tasks
+    if tasks is None:
+        if suite == "lm-eval":
+            tasks = "hellaswag"
+        elif suite == "inspect":
+            tasks = "inspect_evals/simpleqa"
+    if suite in {"lm-eval", "inspect"} and not {task.strip() for task in tasks.split(",") if task.strip()}:
+        ap.error("--tasks must contain at least one task for the selected suite")
     if suite != "iq" and args.iq_categories:
         ap.error("--iq-categories requires --iq or --suite iq")
     if suite == "iq":
@@ -1263,12 +1466,18 @@ def main():
                 ap.error(f"unknown --iq-categories {unknown}; known: {sorted(known)}")
     if suite == "lm-eval" and shutil.which("lm-eval") is None:
         ap.error("lm-eval is not installed; install it with: python3 -m pip install 'lm-eval[api]'")
+    if suite == "inspect" and shutil.which("inspect") is None:
+        ap.error("Inspect AI is not installed; install it with: python3 -m pip install -r requirements-inspect-ai.txt")
 
     for model in args.model:
         try:
+            session_backend = (
+                args.lm_eval_backend if suite == "lm-eval"
+                else f"inspect:{tasks}" if suite == "inspect" else None
+            )
             experiment_id, resumed = begin_experiment(
                 args.url, model, suite, args.experiment_id, args.new_session,
-                args.lm_eval_backend if suite == "lm-eval" else None,
+                session_backend,
                 args.num_fewshot if suite == "lm-eval" else None,
             )
             if resumed:
@@ -1280,8 +1489,10 @@ def main():
                 for _ in range(args.iq_runs):
                     run_iq(args.url, model, RESULTS_DIR, args.iq_tokens, cats, experiment_id)
             elif suite == "lm-eval":
-                run_lm_eval(args.url, model, RESULTS_DIR, args.tasks, args.limit,
+                run_lm_eval(args.url, model, RESULTS_DIR, tasks, args.limit,
                             args.num_fewshot, experiment_id, args.lm_eval_backend)
+            elif suite == "inspect":
+                run_inspect(args.url, model, RESULTS_DIR, tasks, args.limit, experiment_id)
             else:
                 run_model(args.url, model, args.runs, RESULTS_DIR, experiment_id)
         except RuntimeError as e:
